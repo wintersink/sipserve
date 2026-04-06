@@ -1,0 +1,10 @@
+venv4sipserve/
+__pycache__/
+*.pyc
+.DS_Store
+*.egg-info/
+dataset/
+.cache/
+.depthai_cached_models/
+.vscode/
+.claude/
