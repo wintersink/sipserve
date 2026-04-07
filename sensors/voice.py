@@ -14,6 +14,7 @@ Key command IDs (returned by get_command_id()):
 """
 
 import smbus2
+import threading
 import time
 
 MUX_ADDR = 0x70
@@ -30,18 +31,21 @@ _WRITE_DELAY = 0.05
 
 class VoiceSensor:
     def __init__(self, bus: smbus2.SMBus, mux_channel: int,
-                 mux_addr: int = MUX_ADDR, addr: int = VOICE_ADDR):
+                 mux_addr: int = MUX_ADDR, addr: int = VOICE_ADDR,
+                 i2c_lock: threading.Lock | None = None):
         """
         Args:
             bus:         open SMBus instance (bus 1)
             mux_channel: TCA9548A channel (0–7) the sensor is wired to
             mux_addr:    TCA9548A I2C address (default 0x70)
             addr:        DF2301QG I2C address (default 0x64)
+            i2c_lock:    shared lock for mux-dependent I2C operations
         """
         self.bus = bus
         self.mux_channel = mux_channel
         self.mux_addr = mux_addr
         self.addr = addr
+        self._i2c_lock = i2c_lock
 
     # ------------------------------------------------------------------
     # Mux helpers
@@ -65,6 +69,8 @@ class VoiceSensor:
         Returns 0 when the sensor is idle (no new command).
         Call this in a loop; the sensor clears the register after each read.
         """
+        if self._i2c_lock:
+            self._i2c_lock.acquire()
         try:
             self._select()
             data = self.bus.read_i2c_block_data(self.addr, _REG_COMMAND_ID, 1)
@@ -73,9 +79,13 @@ class VoiceSensor:
             return None
         finally:
             self._deselect()
+            if self._i2c_lock:
+                self._i2c_lock.release()
 
     def set_mute(self, mute: bool):
         """Mute (True) or unmute (False) the onboard speaker."""
+        if self._i2c_lock:
+            self._i2c_lock.acquire()
         try:
             self._select()
             self.bus.write_byte_data(self.addr, _REG_MUTE, 0x01 if mute else 0x00)
@@ -84,10 +94,14 @@ class VoiceSensor:
             pass
         finally:
             self._deselect()
+            if self._i2c_lock:
+                self._i2c_lock.release()
 
     def set_volume(self, level: int):
         """Set speaker volume. level must be 0–7."""
         level = max(0, min(7, level))
+        if self._i2c_lock:
+            self._i2c_lock.acquire()
         try:
             self._select()
             self.bus.write_byte_data(self.addr, _REG_VOLUME, level)
@@ -96,6 +110,8 @@ class VoiceSensor:
             pass
         finally:
             self._deselect()
+            if self._i2c_lock:
+                self._i2c_lock.release()
 
 
 # ------------------------------------------------------------------

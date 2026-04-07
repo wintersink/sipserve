@@ -51,6 +51,29 @@ class UltrasonicSensor:
         except OSError:
             return None
 
+    def trigger(self, settle: float = 0.01):
+        """Trigger a measurement. Call read_result() after 150ms."""
+        try:
+            time.sleep(settle)
+            self.bus.write_byte(self.addr, 0x01)
+        except OSError:
+            pass
+
+    def read_result(self, settle: float = 0.01) -> int | None:
+        """Read the result of a previously triggered measurement."""
+        try:
+            time.sleep(settle)
+            msg = smbus2.i2c_msg.read(self.addr, _READ_LEN)
+            self.bus.i2c_rdwr(msg)
+            data = list(msg)
+            um = (data[0] << 16) | (data[1] << 8) | data[2]
+            dist = um // 1000
+            if dist < 20 or dist > 4500:
+                return None
+            return dist
+        except OSError:
+            return None
+
 
 class UltrasonicArray:
     """Manages all 5 ultrasonic sensors through the TCA9548A mux."""

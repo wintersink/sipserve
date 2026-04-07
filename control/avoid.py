@@ -25,11 +25,12 @@ PWM_CONTROL_REG = 0x07   # 8 bytes: 2 bytes big-endian int16 per motor (M1–M4)
 
 # ── Tuning ────────────────────────────────────────────────────────────────────
 OBSTACLE_MM   = 305   # 12 inches
-DRIVE_SPEED   = 350   # forward / backward, range 0–1000
-TURN_SPEED    = 300   # in-place rotation speed
+DRIVE_SPEED   = 385   # forward / backward, range 0–1000
+TURN_SPEED    = 330   # in-place rotation speed
 LOOP_HZ       = 10    # sensor-poll rate while driving forward
 MAX_TURN_S    = 2.0   # seconds to turn before giving up and backing up
 BACKUP_S      = 0.6   # seconds to reverse before re-assessing
+WAIT_CLEAR_S  = 2.0   # seconds to wait for obstacle to move before rotating
 
 LEFT  = "left"
 RIGHT = "right"
@@ -94,6 +95,24 @@ def _apply_turn(bus, direction: str) -> None:
         cmd_turn_left(bus)
 
 
+def _wait_for_obstacle_to_clear(
+    mux: Mux,
+    sensor: UltrasonicSensor,
+    timeout_s: float,
+) -> bool:
+    """
+    Poll sensors for up to *timeout_s* seconds waiting for the path to clear.
+    Returns True if the path clears within the timeout, False otherwise.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        time.sleep(0.1)
+        r = read_all(mux, sensor)
+        if not path_blocked(r):
+            return True
+    return False
+
+
 def _turn_until_clear(
     bus: smbus2.SMBus,
     mux: Mux,
@@ -146,10 +165,14 @@ def run(duration_s: float = 5.0) -> None:
 
             # ── Obstacle detected ─────────────────────────────────────────────
             cmd_stop(bus)
-            print("  Obstacle! Assessing…")
-            time.sleep(0.15)
-            r = read_all(mux, sensor)   # fresh reading after stopping
+            print("  Obstacle! Waiting for it to clear…")
+            if _wait_for_obstacle_to_clear(mux, sensor, WAIT_CLEAR_S):
+                print("  Obstacle cleared — resuming forward.")
+                continue
 
+            # ── Still blocked after waiting: rotate to find a clear path ──────
+            print("  Still blocked — rotating to find clear path…")
+            r = read_all(mux, sensor)
             direction = best_turn_direction(r)
             print(f"  Turning {direction}…")
             cleared = _turn_until_clear(bus, mux, sensor, direction, MAX_TURN_S)
