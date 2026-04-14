@@ -30,7 +30,9 @@ from hardware.motor import (
     Motor,
     FULL_SPEED,
     SLOW_SPEED,
-    TURN_SPEED,
+    SMOOTH_TURN_SPEED,
+    BURST_ROTATE_S,
+    DEG_PER_SEC_AT_BURST_TURN,
 )
 from hardware.mux import Mux, SENSOR_CHANNELS
 from hardware.lcd import SipServeLCD
@@ -74,6 +76,16 @@ LOST_TIMEOUT_S        = 1.0     # LOCKED_ON → LOST after this many seconds of 
 SEARCH_ROTATE_BURST_S = 0.3     # rotate this long then pause to scan
 SEARCH_PAUSE_S        = 0.2     # pause after each burst to let camera settle
 TICK_S                = 0.1     # main loop tick interval
+
+# SEARCHING alternates between a roam phase (reactive obstacle avoidance,
+# same movement logic as smoketests/test_obstacle_avoidance) and a scan
+# phase (burst-rotate for SCAN_DEGREES). Each tick checks for the queued
+# tag first, so LOCKED_ON can be entered from either phase.
+ROAM_DURATION         = 10.0     # seconds per roam phase
+SCAN_DEGREES          = 720.0    # degrees to burst-rotate per scan phase
+SEARCH_OBSTACLE_MM    = 300     # roam-phase obstacle trigger (mm)
+ROAM_REVERSE_S        = 0.5     # reverse this long when front is blocked
+ROAM_TURN_S           = 0.5     # turn this long when front is blocked
 
 TAG_ID_TO_STATION = {tid: name for name, tid in TAG_IDS.items()}
 
@@ -369,6 +381,12 @@ class SipServe:
         self._delivered_at = 0.0           # monotonic timestamp
         self._lost_since = 0.0             # monotonic timestamp when tag disappeared
         self._search_next_burst = 0.0      # when to kick another rotate burst
+        # SEARCHING phase state: "roam" | "scan" | None (= needs init on entry).
+        # Set to None on every entry into SEARCHING so _tick_searching resets
+        # timers and accumulated scan angle.
+        self._search_phase: str | None = None
+        self._search_phase_start: float = 0.0
+        self._search_scan_deg: float = 0.0
         self._update_lcd()
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
@@ -388,6 +406,9 @@ class SipServe:
             print(f"\n[state] {self.state.value} → {new.value}")
             self.motor.stop()
             self.state = new
+            if new == State.SEARCHING:
+                # Sentinel — _tick_searching will initialize phase + timers
+                self._search_phase = None
             self._update_lcd()
 
     def _current_target_name(self) -> str | None:
@@ -469,10 +490,10 @@ class SipServe:
         if info and info["px"] is not None:
             dx = info["px"] - TAG_INPUT_W / 2.0
             if dx > 60:
-                self.motor.turn_right(TURN_SPEED)
+                self.motor.turn_right(SMOOTH_TURN_SPEED)
                 return
             elif dx < -60:
-                self.motor.turn_left(TURN_SPEED)
+                self.motor.turn_left(SMOOTH_TURN_SPEED)
                 return
         self.motor.forward(speed)
 
@@ -487,7 +508,7 @@ class SipServe:
         # Gentle rotation bursts to scan
         now = time.monotonic()
         if now >= self._search_next_burst:
-            self.motor.turn_right(TURN_SPEED)
+            self.motor.turn_right(SMOOTH_TURN_SPEED)
             self._search_next_burst = now + SEARCH_ROTATE_BURST_S + SEARCH_PAUSE_S
         elif now >= self._search_next_burst - SEARCH_PAUSE_S:
             self.motor.stop()
@@ -495,6 +516,51 @@ class SipServe:
     def _tick_awaiting_orders(self):
         self.motor.stop()
         self._handle_voice_in_ordering()
+
+    def _roam_tick(self):
+        """One tick of reactive obstacle-avoidance roaming.
+
+        Mirrors the movement logic in smoketests/test_obstacle_avoidance:
+          - front blocked OR both front sides → stop, reverse, turn away
+          - front_left only  → turn right
+          - front_right only → turn left
+          - left/right only  → forward slow
+          - clear            → forward full
+        The reverse+turn branch is blocking (matches the reference script);
+        the other branches are non-blocking so tag pickup remains responsive.
+        """
+        snap = self.sonar.snapshot()
+        def trig(name):
+            d = snap.get(name)
+            return d is not None and d < SEARCH_OBSTACLE_MM
+
+        front = trig("front")
+        fl = trig("front_left")
+        fr = trig("front_right")
+        left = trig("left")
+        right = trig("right")
+
+        if front or (fl and fr):
+            self.motor.stop()
+            self.motor.reverse()
+            time.sleep(ROAM_REVERSE_S)
+            self.motor.stop()
+            fl_mm = snap.get("front_left") if snap.get("front_left") is not None else 9999
+            fr_mm = snap.get("front_right") if snap.get("front_right") is not None else 9999
+            if fl_mm <= fr_mm:
+                self.motor.turn_right()
+            else:
+                self.motor.turn_left()
+            time.sleep(ROAM_TURN_S)
+            self.motor.stop()
+        elif fl:
+            self.motor.turn_right()
+        elif fr:
+            self.motor.turn_left()
+        elif left or right:
+            self.motor.forward(SLOW_SPEED)
+        else:
+            self.motor.forward(FULL_SPEED)
 
     def _tick_searching(self):
         target = self._current_target_id()
@@ -505,13 +571,30 @@ class SipServe:
             self._lost_since = 0
             self._set_state(State.LOCKED_ON)
             return
-        # Rotate in bursts to let camera settle between
-        now = time.monotonic()
-        if now >= self._search_next_burst:
-            self.motor.turn_right(TURN_SPEED)
-            self._search_next_burst = now + SEARCH_ROTATE_BURST_S + SEARCH_PAUSE_S
-        elif now >= self._search_next_burst - SEARCH_PAUSE_S:
+
+        # First tick of a fresh SEARCHING entry — initialize the phase cycle.
+        if self._search_phase is None:
+            self._search_phase = "roam"
+            self._search_phase_start = time.monotonic()
+            self._search_scan_deg = 0.0
+
+        if self._search_phase == "roam":
+            if time.monotonic() - self._search_phase_start >= ROAM_DURATION:
+                self.motor.stop()
+                self._search_phase = "scan"
+                self._search_scan_deg = 0.0
+                return
+            self._roam_tick()
+            return
+
+        # "scan" — one burst_rotate per tick until SCAN_DEGREES accumulated.
+        if self._search_scan_deg >= SCAN_DEGREES:
             self.motor.stop()
+            self._search_phase = "roam"
+            self._search_phase_start = time.monotonic()
+            return
+        self.motor.burst_rotate("right")
+        self._search_scan_deg += BURST_ROTATE_S * DEG_PER_SEC_AT_BURST_TURN
 
     def _tick_locked_on(self):
         target = self._current_target_id()
@@ -542,7 +625,7 @@ class SipServe:
         # Slow scan to reacquire
         now = time.monotonic()
         if now >= self._search_next_burst:
-            self.motor.turn_right(TURN_SPEED)
+            self.motor.turn_right(SMOOTH_TURN_SPEED)
             self._search_next_burst = now + SEARCH_ROTATE_BURST_S + SEARCH_PAUSE_S
         elif now >= self._search_next_burst - SEARCH_PAUSE_S:
             self.motor.stop()
@@ -575,7 +658,7 @@ class SipServe:
             # Lost home — scan
             now = time.monotonic()
             if now >= self._search_next_burst:
-                self.motor.turn_right(TURN_SPEED)
+                self.motor.turn_right(SMOOTH_TURN_SPEED)
                 self._search_next_burst = now + SEARCH_ROTATE_BURST_S + SEARCH_PAUSE_S
             elif now >= self._search_next_burst - SEARCH_PAUSE_S:
                 self.motor.stop()

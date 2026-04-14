@@ -22,7 +22,7 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import smbus2
-from hardware.motor import Motor, FULL_SPEED, SLOW_SPEED, TURN_SPEED
+from hardware.motor import Motor, FULL_SPEED, SLOW_SPEED, SMOOTH_TURN_SPEED
 from hardware.mux import Mux, SENSOR_CHANNELS
 from sensors.ultrasonic import UltrasonicSensor
 

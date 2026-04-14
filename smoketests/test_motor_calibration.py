@@ -1,12 +1,13 @@
 """
 Time-based motor calibration.
 
-Drives at FULL_SPEED / TURN_SPEED for a fixed duration and asks you to measure
-the result. Computes mm/sec and deg/sec you should plug into hardware/motor.py.
+Drives at FULL_SPEED / SMOOTH_TURN_SPEED for a fixed duration and asks you
+to measure the result. Computes the per-PWM-unit calibration primitives
+you should plug into hardware/motor.py.
 
 Commands:
-  d  — drive forward for 3 seconds at FULL_SPEED
-  r  — rotate right for 2 seconds at TURN_SPEED
+  d  — drive forward at FULL_SPEED
+  r  — rotate right at SMOOTH_TURN_SPEED
   q  — quit
 
 Repeat each test a few times with different durations and average the results.
@@ -22,9 +23,11 @@ import smbus2
 from hardware.motor import (
     Motor,
     FULL_SPEED,
-    TURN_SPEED,
+    SMOOTH_TURN_SPEED,
+    MM_PER_SEC_PER_PWM,
+    DEG_PER_SEC_PER_PWM,
     MM_PER_SEC_AT_FULL,
-    DEG_PER_SEC_AT_TURN,
+    DEG_PER_SEC_AT_SMOOTH_TURN,
 )
 
 DRIVE_DURATION_S  = 5.0
@@ -49,15 +52,19 @@ def drive_test():
         print("  Skipped.")
         return
     mm_per_sec = mm / DRIVE_DURATION_S
-    print(f"  → {mm_per_sec:.1f} mm/sec  (current constant: {MM_PER_SEC_AT_FULL})")
-    print(f"  Set MM_PER_SEC_AT_FULL = {mm_per_sec:.1f} in hardware/motor.py")
+    new_per_pwm = mm_per_sec / FULL_SPEED
+    print(f"  → {mm_per_sec:.1f} mm/sec at FULL_SPEED "
+          f"(current derived: {MM_PER_SEC_AT_FULL:.1f})")
+    print(f"  Set MM_PER_SEC_PER_PWM = {new_per_pwm:.4f} in hardware/motor.py "
+          f"(current: {MM_PER_SEC_PER_PWM})")
 
 
 def rotate_test():
-    print(f"\nRotating right at TURN_SPEED ({TURN_SPEED}) for {ROTATE_DURATION_S}s...")
+    print(f"\nRotating right at SMOOTH_TURN_SPEED ({SMOOTH_TURN_SPEED}) "
+          f"for {ROTATE_DURATION_S}s...")
     print("Mark the starting heading. Starting in 2s...")
     time.sleep(2)
-    motor.turn_right(TURN_SPEED)
+    motor.turn_right(SMOOTH_TURN_SPEED)
     time.sleep(ROTATE_DURATION_S)
     motor.stop()
     print("Stopped. Estimate the angle rotated (degrees).")
@@ -68,8 +75,11 @@ def rotate_test():
         print("  Skipped.")
         return
     deg_per_sec = deg / ROTATE_DURATION_S
-    print(f"  → {deg_per_sec:.1f} deg/sec  (current constant: {DEG_PER_SEC_AT_TURN})")
-    print(f"  Set DEG_PER_SEC_AT_TURN = {deg_per_sec:.1f} in hardware/motor.py")
+    new_per_pwm = deg_per_sec / SMOOTH_TURN_SPEED
+    print(f"  → {deg_per_sec:.1f} deg/sec at SMOOTH_TURN_SPEED "
+          f"(current derived: {DEG_PER_SEC_AT_SMOOTH_TURN:.1f})")
+    print(f"  Set DEG_PER_SEC_PER_PWM = {new_per_pwm:.4f} in hardware/motor.py "
+          f"(current: {DEG_PER_SEC_PER_PWM:.4f})")
 
 
 COMMANDS = {
@@ -82,8 +92,10 @@ if __name__ == "__main__":
     motor.set_motor_parameter()
     motor.stop()
     print("Current calibration:")
-    print(f"  MM_PER_SEC_AT_FULL  = {MM_PER_SEC_AT_FULL}")
-    print(f"  DEG_PER_SEC_AT_TURN = {DEG_PER_SEC_AT_TURN}")
+    print(f"  MM_PER_SEC_PER_PWM         = {MM_PER_SEC_PER_PWM}")
+    print(f"  DEG_PER_SEC_PER_PWM        = {DEG_PER_SEC_PER_PWM:.4f}")
+    print(f"  MM_PER_SEC_AT_FULL         = {MM_PER_SEC_AT_FULL:.1f}")
+    print(f"  DEG_PER_SEC_AT_SMOOTH_TURN = {DEG_PER_SEC_AT_SMOOTH_TURN:.1f}")
     print("\nCommands: d=drive  r=rotate  q=quit")
 
     try:

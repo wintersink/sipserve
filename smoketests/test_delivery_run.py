@@ -32,12 +32,14 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 sys.path.insert(0, os.path.join(_HERE, ".."))
 
-import IIC
 from sensors.apriltag import (send_roi_configs,
                               TAG_INPUT_W, TAG_INPUT_H,
                               DEPTH_MIN_MM, DEPTH_MAX_MM)
 from sensors.ultrasonic import UltrasonicSensor
 from hardware.mux import Mux, SENSOR_CHANNELS
+from hardware.motor import (Motor,
+                            SMOOTH_TURN_SPEED,
+                            BURST_ROTATE_S, BURST_PAUSE_S)
 from config import TAG_IDS
 from hardware.lcd import SipServeLCD
 from sensors.voice import VoiceSensor
@@ -46,17 +48,14 @@ from sensors.voice import VoiceSensor
 
 IMU_RATE_HZ = 100
 
-# Speeds (PWM magnitude — sent as negative for forward, positive for backward).
-# NOTE: this file uses raw IIC.control_pwm with a ±1000-ish range. The newer
-# hardware/motor.Motor class uses ±7200. Don't mix values between the two.
+# Speeds (PWM magnitude — sent as negative for forward, positive for backward
+# by the Motor class's wiring convention). Motor.control_pwm accepts ±7200;
+# values used here are in those units. SMOOTH_TURN_SPEED comes from
+# hardware/motor.py so the Motor class owns rotation-style defaults.
 ROAM_SPEED     = 800   # cruising while searching for tag
 CRUISE_SPEED   = 500   # driving toward a visible tag, far away
 APPROACH_SPEED = 250   # close to tag, fine control
 TURN_SPEED     = 300   # centering corrections during NAVIGATE
-SMOOTH_TURN_SPEED = 270   # 10% slower than TURN_SPEED — used only for the
-                          # continuous "find clear path / find home" rotations
-                          # so the camera has better chance to detect tags
-                          # during a non-bursted rotation.
 AVOID_TURN     = 300   # turning away from obstacles
 BACKUP_SPEED   = 300   # reversing away from an obstacle
 
@@ -87,10 +86,8 @@ BACKUP_S           = 0.5   # seconds to reverse if turn times out
 # before giving up and proceeding (prevents infinite spin in a tight corridor).
 SEARCH_CLEAR_PATH_TIMEOUT_S = 8.0
 
-# Burst-rotate timing: short turn bursts with pauses to avoid motion blur
-# on the AprilTag detector (camera needs a still frame to detect reliably).
-SEARCH_ROTATE_BURST_S = 0.3   # rotate this long per burst
-SEARCH_PAUSE_S        = 0.2   # pause after each burst to let camera settle
+# Burst-rotate timing is owned by hardware/motor.py (BURST_ROTATE_S /
+# BURST_PAUSE_S) — Motor.burst_rotate() uses those defaults.
 
 
 # ── State machine ─────────────────────────────────────────────────────────────
@@ -123,8 +120,16 @@ class State(enum.Enum):
 
 
 # ── Motor helpers ─────────────────────────────────────────────────────────────
-# Negative PWM = forward on this robot (wiring is inverted).
-# M1 = right tread, M3 = left tread.
+# All motor output goes through the shared `hardware.motor.Motor` instance,
+# which owns the wiring convention (negative PWM = forward; M1 = right tread,
+# M3 = left tread) and the burst / smooth rotation primitives.
+
+_motor: Motor | None = None
+
+def set_motor(motor: Motor) -> None:
+    """Register the Motor instance used by the module-level helpers below."""
+    global _motor
+    _motor = motor
 
 # Hard safety floor: if any front-facing ultrasonic reads < OBSTACLE_MM (8"),
 # forward() refuses to move. `stop()`, `backward()`, and turns are always
@@ -150,22 +155,22 @@ def _safety_halt() -> bool:
     return tripped
 
 def stop():
-    IIC.control_pwm(0, 0, 0, 0)
+    _motor.stop()
 
 def forward(speed=ROAM_SPEED):
     if _safety_halt():
-        IIC.control_pwm(0, 0, 0, 0)
+        _motor.stop()
         return
-    IIC.control_pwm(-speed, 0, -speed, 0)
+    _motor.forward(speed)
 
 def backward(speed=BACKUP_SPEED):
-    IIC.control_pwm(speed, 0, speed, 0)
+    _motor.reverse(speed)
 
 def turn_left(speed=TURN_SPEED):
-    IIC.control_pwm(-speed, 0, speed, 0)
+    _motor.turn_left(speed)
 
 def turn_right(speed=TURN_SPEED):
-    IIC.control_pwm(speed, 0, -speed, 0)
+    _motor.turn_right(speed)
 
 
 # ── Ultrasonic background poller ──────────────────────────────────────────────
@@ -245,6 +250,17 @@ class UltrasonicPoller:
     def front_blocked(self) -> bool:
         snap = self.snapshot()
         return any(_safe(snap.get(k)) < OBSTACLE_MM
+                   for k in ("front", "front_left", "front_right"))
+
+    def front_boxed_in(self, threshold_mm: int = STOP_DIST_MM) -> bool:
+        """True if all three front-facing ultrasonics read <= threshold_mm.
+
+        Indicates the robot is wedged against a wall or concave obstacle —
+        no side-pivot will clear it, so the only useful escape is an
+        about-face (180°). Default threshold = STOP_DIST_MM (12 in).
+        """
+        snap = self.snapshot()
+        return all(_safe(snap.get(k)) <= threshold_mm
                    for k in ("front", "front_left", "front_right"))
 
     def min_front_dist(self) -> int:
@@ -498,25 +514,6 @@ def _bearing_to_dir(bearing: float | None, default: str = "right") -> str:
     return "right" if bearing > 0 else "left"
 
 
-def _rotate_in(direction: str, speed: int):
-    if direction == "right":
-        turn_right(speed)
-    else:
-        turn_left(speed)
-
-
-def _burst_rotate(direction: str, speed: int):
-    """Rotate in a short burst then pause to let the camera settle.
-
-    This avoids motion blur on the AprilTag detector — the camera needs
-    a still frame to detect tags reliably.
-    """
-    _rotate_in(direction, speed)
-    time.sleep(SEARCH_ROTATE_BURST_S)
-    stop()
-    time.sleep(SEARCH_PAUSE_S)
-
-
 def _spin_search(gyro, queues, tracker, target_ids: set[int],
                  sweep_deg: float = SPIN_SWEEP_DEG) -> bool:
     """Spin in place up to *sweep_deg* scanning for any tag in target_ids.
@@ -531,12 +528,7 @@ def _spin_search(gyro, queues, tracker, target_ids: set[int],
     gyro.reset()
     gyro.update(queues["imu"])
     while abs(gyro.update(queues["imu"])) < sweep_deg:
-        # Burst: rotate briefly
-        turn_right(TURN_SPEED)
-        time.sleep(SEARCH_ROTATE_BURST_S)
-        stop()
-        # Pause: let camera settle and grab a frame
-        time.sleep(SEARCH_PAUSE_S)
+        _motor.burst_rotate("right", TURN_SPEED)
         gyro.update(queues["imu"])
         # Check for target tag during the still moment — require it to be in
         # the drive-toward FOV window, not merely visible at the edge.
@@ -704,12 +696,7 @@ def _rotate_clear(sonar, queues, gyro,
           f"(bearing={tag_bearing}, prefer={prefer_dir})…")
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        # Burst: rotate briefly
-        _rotate_in(direction, AVOID_TURN)
-        time.sleep(SEARCH_ROTATE_BURST_S)
-        stop()
-        # Pause: let camera settle and check
-        time.sleep(SEARCH_PAUSE_S)
+        _motor.burst_rotate(direction, AVOID_TURN)
         gyro.update(queues["imu"])
         queues["tags"].tryGet()
         queues["spatial"].tryGet()
@@ -731,6 +718,21 @@ def _rotate_clear(sonar, queues, gyro,
 POST_DELIVER_FORWARD_S = 2.0  # max forward-drive time after 180° turn-away
 
 
+def _rotate_180(gyro, queues) -> None:
+    """Burst-rotate right until the gyro integrates 180° of yaw change.
+
+    Used when the front is fully boxed in (front_left + front + front_right
+    all within STOP_DIST_MM) — a side-pivot can't help, so about-face.
+    """
+    print("  Front boxed in (all three < 12\") — rotating 180°")
+    gyro.reset()
+    gyro.update(queues["imu"])
+    while abs(gyro.update(queues["imu"])) < 180.0:
+        _motor.burst_rotate("right", TURN_SPEED)
+        gyro.update(queues["imu"])
+    stop()
+
+
 def _turn_until_front_clear(sonar, queues, gyro, tracker, search_ids):
     """Reorient after a delivery.
 
@@ -748,7 +750,7 @@ def _turn_until_front_clear(sonar, queues, gyro, tracker, search_ids):
     gyro.reset()
     gyro.update(queues["imu"])
     while abs(gyro.update(queues["imu"])) < 180.0:
-        _burst_rotate("right", TURN_SPEED)
+        _motor.burst_rotate("right", TURN_SPEED)
         gyro.update(queues["imu"])
     stop()
 
@@ -763,7 +765,7 @@ def _turn_until_front_clear(sonar, queues, gyro, tracker, search_ids):
                 stop()
                 print("  Front clear — ready to resume")
                 return
-            _burst_rotate("right", AVOID_TURN)
+            _motor.burst_rotate("right", AVOID_TURN)
         stop()
         print("  Turn-away timed out — front still blocked")
         return
@@ -799,9 +801,11 @@ def _queue_table_numbers(q) -> list[int]:
 
 def deliver() -> None:
     # Hardware init
-    IIC.set_motor_parameter()
-    stop()
     bus = smbus2.SMBus(1)
+    motor = Motor(bus)
+    motor.set_motor_parameter()
+    set_motor(motor)
+    motor.stop()
     lcd = SipServeLCD(bus_number=1)
     i2c_lock = threading.Lock()
     sonar = UltrasonicPoller(bus, i2c_lock=i2c_lock)
@@ -862,6 +866,21 @@ def deliver() -> None:
             while pipeline.isRunning():
                 gyro.update(queues["imu"])
 
+                # ── Boxed-in escape ───────────────────────────────────────
+                # If front_left + front + front_right all read ≤ 12 in, the
+                # robot is wedged — no side-pivot will help. About-face,
+                # reset the SEARCHING clear-path flag so the next tick
+                # re-validates the new heading, and continue.
+                if (state in (State.SEARCHING, State.LOCKED, State.RETURNING)
+                        and sonar.front_boxed_in()):
+                    stop()
+                    _rotate_180(gyro, queues)
+                    last_avoid_dir = None
+                    if state == State.SEARCHING:
+                        search_path_clear = False
+                        clear_path_start = None
+                    continue
+
                 # ── Voice commands — only processed during ORDERING ───────
                 # Wake word gates table-queuing only. CLEAR and START work at
                 # any time so the operator can always cancel or launch.
@@ -919,7 +938,7 @@ def deliver() -> None:
                         state = State.ORDERING
                         lcd.update_state("ORDERING")
                     else:
-                        _burst_rotate("right", AVOID_TURN)
+                        _motor.burst_rotate("right", AVOID_TURN)
 
                 # ── ORDERING: stationary, wait for voice input ─────────────
                 elif state == State.ORDERING:
@@ -998,7 +1017,7 @@ def deliver() -> None:
                         # want to find clearance fast, not accumulate still-frame
                         # tag detections. The tag-spotted escape path above still
                         # runs every tick so we can lock on mid-rotation.
-                        turn_right(SMOOTH_TURN_SPEED)
+                        _motor.smooth_turn("right")
                         continue
 
                     # Obstacle first — always safe before moving
@@ -1088,7 +1107,7 @@ def deliver() -> None:
                         offset_px = tag_px - _CAM_CENTER_PX
                         if abs(offset_px) > CENTER_TOL_PX:
                             direction = "right" if offset_px > 0 else "left"
-                            _burst_rotate(direction, TURN_SPEED)
+                            _motor.burst_rotate(direction, TURN_SPEED)
                             continue
 
                     # Tag centered, OR no fresh tag data this tick — drive forward.
@@ -1163,7 +1182,7 @@ def deliver() -> None:
                         # Home not visible — burst-rotate to search.
                         if search_rotate_dir is None:
                             search_rotate_dir = _bearing_to_dir(home_last_bearing, "right")
-                        _burst_rotate(search_rotate_dir, TURN_SPEED)
+                        _motor.burst_rotate(search_rotate_dir, TURN_SPEED)
                         continue
 
                     home_last_bearing = tag_px - _CAM_CENTER_PX
@@ -1171,7 +1190,7 @@ def deliver() -> None:
                     if abs(offset_px) > CENTER_TOL_PX:
                         direction = "right" if offset_px > 0 else "left"
                         search_rotate_dir = direction
-                        _burst_rotate(direction, TURN_SPEED)
+                        _motor.burst_rotate(direction, TURN_SPEED)
                         continue
 
                     # Home centered — drive forward until ultrasonic trips.

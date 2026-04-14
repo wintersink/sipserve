@@ -22,10 +22,34 @@ WHEEL_DIA_REG        = 0x05
 SPEED_CONTROL_REG    = 0x06
 PWM_CONTROL_REG      = 0x07
 
-# ── Default speeds (PWM units out of 7200) ────────────────────────────────────
-FULL_SPEED = 720    # ~10% duty cycle
+# ── Default drive speed (PWM units out of 7200) ───────────────────────────────
+FULL_SPEED = 1440    # 720 is ~10% duty cycle — straight-line cruise
 SLOW_SPEED = 360    # ~5%  duty cycle
-TURN_SPEED = 360    # in-place rotation
+
+# ── Rotation-style speeds ─────────────────────────────────────────────────────
+# Two distinct rotation styles, each with its own speed knob so they can be
+# tuned independently. There is intentionally no generic "TURN_SPEED" — pick
+# the style you want and edit the matching constant.
+#
+# BURST_TURN_SPEED — used by Motor.burst_rotate() for short rotation pulses
+#   that alternate with still pauses so the AprilTag detector gets sharp
+#   frames between motions. Tune this to control how far per burst the robot
+#   sweeps; pair with BURST_ROTATE_S for the time-per-pulse.
+#
+# SMOOTH_TURN_SPEED — used by Motor.smooth_turn() AND by the bare
+#   turn_left / turn_right / rotate primitives. Continuous (no-pause)
+#   rotation, e.g. spinning to find a clear path. Slower than
+#   BURST_TURN_SPEED so the camera retains a chance to catch tags during
+#   uninterrupted rotation. Tune this for scan / clear-path / general
+#   in-place rotation behavior.
+BURST_TURN_SPEED  = 720   # per-pulse speed for Motor.burst_rotate
+SMOOTH_TURN_SPEED = 270   # continuous-rotation speed for everything else
+
+# ── Burst-rotate timing ───────────────────────────────────────────────────────
+# Pulse width / pause width for Motor.burst_rotate. Affects WHEN the motors
+# stop, not how fast they spin (that's BURST_TURN_SPEED above).
+BURST_ROTATE_S = 0.3   # rotate this long per burst
+BURST_PAUSE_S  = 0.2   # pause after each burst to let the camera settle
 
 # ── Robot geometry ────────────────────────────────────────────────────────────
 WHEEL_DIAMETER_MM = 55.0     # 520 motor wheels
@@ -35,9 +59,20 @@ ENCODER_PPR       = 11       # informational — encoders aren't wired/reliable
 
 # ── Time-based movement calibration ───────────────────────────────────────────
 # Measured empirically — see smoketests/test_motor_calibration.py
-# These are at FULL_SPEED / TURN_SPEED respectively.
-MM_PER_SEC_AT_FULL  = 288.0   # measured at FULL_SPEED (720 PWM)
-DEG_PER_SEC_AT_TURN = 84.0    # measured at TURN_SPEED (360 PWM)
+# Per-PWM-unit rates are the calibration primitives; the at-FULL_SPEED and
+# at-SMOOTH_TURN_SPEED constants are derived so changing those speed knobs
+# automatically rescales the dead-reckoning math (assumes linearity, which
+# holds well enough in the operating range we use).
+#
+# Original calibration points:
+#   straight-line: 288.0 mm/sec @ FULL_SPEED=720  → 0.4    mm/sec/PWM
+#   in-place spin: 84.0  deg/sec @ 360 PWM        → 0.2333 deg/sec/PWM
+MM_PER_SEC_PER_PWM  = 0.4
+DEG_PER_SEC_PER_PWM = 84.0 / 360.0   # ≈ 0.2333
+
+MM_PER_SEC_AT_FULL          = MM_PER_SEC_PER_PWM  * FULL_SPEED         # 288.0
+DEG_PER_SEC_AT_SMOOTH_TURN  = DEG_PER_SEC_PER_PWM * SMOOTH_TURN_SPEED  # ≈ 63.0
+DEG_PER_SEC_AT_BURST_TURN   = DEG_PER_SEC_PER_PWM * BURST_TURN_SPEED   # ≈ 168.0
 
 
 class Motor:
@@ -99,13 +134,51 @@ class Motor:
     def reverse(self, speed: int = FULL_SPEED) -> None:
         self.control_pwm(speed, 0, speed, 0)
 
-    def turn_left(self, speed: int = TURN_SPEED) -> None:
+    def turn_left(self, speed: int = SMOOTH_TURN_SPEED) -> None:
         # left tread backward, right tread forward
         self.control_pwm(-speed, 0, speed, 0)
 
-    def turn_right(self, speed: int = TURN_SPEED) -> None:
+    def turn_right(self, speed: int = SMOOTH_TURN_SPEED) -> None:
         # left tread forward, right tread backward
         self.control_pwm(speed, 0, -speed, 0)
+
+    # ── Burst / smooth turns ──────────────────────────────────────────────────
+
+    def smooth_turn(self, direction: str, speed: int = SMOOTH_TURN_SPEED) -> None:
+        """Continuous (non-bursted) rotation at a gentler speed.
+
+        Use when rotating until a condition is met (e.g. clear path found)
+        without introducing still-frame pauses. Caller is responsible for
+        calling stop() when done.
+        """
+        if direction == "right":
+            self.turn_right(speed)
+        elif direction == "left":
+            self.turn_left(speed)
+        else:
+            raise ValueError(f"direction must be 'left' or 'right', got {direction!r}")
+
+    def burst_rotate(self, direction: str,
+                     speed: int = BURST_TURN_SPEED,
+                     burst_s: float = BURST_ROTATE_S,
+                     pause_s: float = BURST_PAUSE_S) -> None:
+        """Rotate in a short burst, then stop and pause.
+
+        Defaults to BURST_TURN_SPEED so this rotation style stays tunable
+        independently of SMOOTH_TURN_SPEED (which drives the bare
+        turn_left / turn_right primitives this method calls into).
+        The pause between bursts leaves still frames for the AprilTag
+        detector — motion blur destroys tag detection reliability.
+        """
+        if direction == "right":
+            self.turn_right(speed)
+        elif direction == "left":
+            self.turn_left(speed)
+        else:
+            raise ValueError(f"direction must be 'left' or 'right', got {direction!r}")
+        time.sleep(burst_s)
+        self.stop()
+        time.sleep(pause_s)
 
     # ── Distance / angle movement (time-based, blocking) ──────────────────────
     # Encoders aren't reliable on this robot, so we dead-reckon with calibrated
@@ -125,9 +198,15 @@ class Motor:
         finally:
             self.stop()
 
-    def rotate(self, degrees: float, speed: int = TURN_SPEED) -> None:
-        """Rotate in place by *degrees*. Positive = right (clockwise from above)."""
-        duration = abs(degrees) / DEG_PER_SEC_AT_TURN
+    def rotate(self, degrees: float, speed: int = SMOOTH_TURN_SPEED) -> None:
+        """Rotate in place by *degrees*. Positive = right (clockwise from above).
+
+        Duration is derived from DEG_PER_SEC_AT_SMOOTH_TURN, which is
+        SMOOTH_TURN_SPEED × DEG_PER_SEC_PER_PWM. If you call this with a
+        non-default speed, the dead-reckoned duration will be off in
+        proportion to (speed / SMOOTH_TURN_SPEED).
+        """
+        duration = abs(degrees) / DEG_PER_SEC_AT_SMOOTH_TURN
         if duration <= 0:
             return
         if degrees >= 0:
