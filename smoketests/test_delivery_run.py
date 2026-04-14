@@ -802,12 +802,13 @@ def _queue_table_numbers(q) -> list[int]:
 def deliver() -> None:
     # Hardware init
     bus = smbus2.SMBus(1)
-    motor = Motor(bus)
+    i2c_lock = threading.Lock()
+    # Share the lock so Motor writes can't collide with the mux/voice poller.
+    motor = Motor(bus, i2c_lock=i2c_lock)
     motor.set_motor_parameter()
     set_motor(motor)
     motor.stop()
     lcd = SipServeLCD(bus_number=1)
-    i2c_lock = threading.Lock()
     sonar = UltrasonicPoller(bus, i2c_lock=i2c_lock)
     set_safety_sonar(sonar)  # hard-stop forward() if front <8"
     voice = VoicePoller(bus, i2c_lock=i2c_lock)

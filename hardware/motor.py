@@ -8,6 +8,9 @@ On this robot, negative PWM drives forward (wiring convention).
 PWM range: -7200 to 7200 (0 to ~100% duty cycle).
 """
 
+import contextlib
+import threading
+
 import smbus2
 import struct
 import time
@@ -23,7 +26,7 @@ SPEED_CONTROL_REG    = 0x06
 PWM_CONTROL_REG      = 0x07
 
 # ── Default drive speed (PWM units out of 7200) ───────────────────────────────
-FULL_SPEED = 1440    # 720 is ~10% duty cycle — straight-line cruise
+FULL_SPEED = 720    # 720 is ~10% duty cycle — straight-line cruise
 SLOW_SPEED = 360    # ~5%  duty cycle
 
 # ── Rotation-style speeds ─────────────────────────────────────────────────────
@@ -42,14 +45,14 @@ SLOW_SPEED = 360    # ~5%  duty cycle
 #   BURST_TURN_SPEED so the camera retains a chance to catch tags during
 #   uninterrupted rotation. Tune this for scan / clear-path / general
 #   in-place rotation behavior.
-BURST_TURN_SPEED  = 720   # per-pulse speed for Motor.burst_rotate
-SMOOTH_TURN_SPEED = 270   # continuous-rotation speed for everything else
+BURST_TURN_SPEED  = 560   # per-pulse speed for Motor.burst_rotate
+SMOOTH_TURN_SPEED = 720   # continuous-rotation speed for everything else
 
 # ── Burst-rotate timing ───────────────────────────────────────────────────────
 # Pulse width / pause width for Motor.burst_rotate. Affects WHEN the motors
 # stop, not how fast they spin (that's BURST_TURN_SPEED above).
 BURST_ROTATE_S = 0.3   # rotate this long per burst
-BURST_PAUSE_S  = 0.2   # pause after each burst to let the camera settle
+BURST_PAUSE_S  = 0.4   # pause after each burst to let the camera settle
 
 # ── Robot geometry ────────────────────────────────────────────────────────────
 WHEEL_DIAMETER_MM = 55.0     # 520 motor wheels
@@ -65,10 +68,10 @@ ENCODER_PPR       = 11       # informational — encoders aren't wired/reliable
 # holds well enough in the operating range we use).
 #
 # Original calibration points:
-#   straight-line: 288.0 mm/sec @ FULL_SPEED=720  → 0.4    mm/sec/PWM
-#   in-place spin: 84.0  deg/sec @ 360 PWM        → 0.2333 deg/sec/PWM
-MM_PER_SEC_PER_PWM  = 0.4
-DEG_PER_SEC_PER_PWM = 84.0 / 360.0   # ≈ 0.2333
+#   straight-line: 288.0 mm/sec @ FULL_SPEED=1440  → 0.2    mm/sec/PWM
+#   in-place spin: 84.0  deg/sec @ 720 PWM        → 0.1167 deg/sec/PWM
+MM_PER_SEC_PER_PWM  = 0.2
+DEG_PER_SEC_PER_PWM = 72.0 / 720.0   # ≈ 0.1167
 
 MM_PER_SEC_AT_FULL          = MM_PER_SEC_PER_PWM  * FULL_SPEED         # 288.0
 DEG_PER_SEC_AT_SMOOTH_TURN  = DEG_PER_SEC_PER_PWM * SMOOTH_TURN_SPEED  # ≈ 63.0
@@ -76,11 +79,22 @@ DEG_PER_SEC_AT_BURST_TURN   = DEG_PER_SEC_PER_PWM * BURST_TURN_SPEED   # ≈ 168
 
 
 class Motor:
-    """Yahboom 4-channel motor driver (I2C)."""
+    """Yahboom 4-channel motor driver (I2C).
 
-    def __init__(self, bus: smbus2.SMBus, addr: int = MOTOR_ADDR):
+    If multiple devices share this SMBus (ultrasonic mux, voice recognizer,
+    LCD, etc.), pass an `i2c_lock` shared with those peers. Every bus write
+    here will acquire it, preventing mid-transaction collisions that
+    otherwise show up as OSError(EREMOTEIO).
+    """
+
+    def __init__(self, bus: smbus2.SMBus, addr: int = MOTOR_ADDR,
+                 i2c_lock: threading.Lock | None = None):
         self.bus = bus
         self.addr = addr
+        # Use the shared lock if provided, else a no-op context manager so
+        # standalone use (no other bus peers) doesn't pay locking overhead
+        # or require a dummy lock at every call site.
+        self._lock = i2c_lock if i2c_lock is not None else contextlib.nullcontext()
 
     # ── Raw control ───────────────────────────────────────────────────────────
 
@@ -92,12 +106,14 @@ class Motor:
             (m3 >> 8) & 0xFF, m3 & 0xFF,
             (m4 >> 8) & 0xFF, m4 & 0xFF,
         ]
-        self.bus.write_i2c_block_data(self.addr, PWM_CONTROL_REG, data)
+        with self._lock:
+            self.bus.write_i2c_block_data(self.addr, PWM_CONTROL_REG, data)
 
     # ── One-time configuration ────────────────────────────────────────────────
 
     def _write(self, reg: int, data: list) -> None:
-        self.bus.write_i2c_block_data(self.addr, reg, data)
+        with self._lock:
+            self.bus.write_i2c_block_data(self.addr, reg, data)
 
     def set_motor_type(self, t: int) -> None:
         self._write(MOTOR_TYPE_REG, [t])

@@ -82,10 +82,16 @@ TICK_S                = 0.1     # main loop tick interval
 # phase (burst-rotate for SCAN_DEGREES). Each tick checks for the queued
 # tag first, so LOCKED_ON can be entered from either phase.
 ROAM_DURATION         = 10.0     # seconds per roam phase
-SCAN_DEGREES          = 720.0    # degrees to burst-rotate per scan phase
+SCAN_DEGREES          = 960.0    # degrees to burst-rotate per scan phase
 SEARCH_OBSTACLE_MM    = 300     # roam-phase obstacle trigger (mm)
 ROAM_REVERSE_S        = 0.5     # reverse this long when front is blocked
 ROAM_TURN_S           = 0.5     # turn this long when front is blocked
+
+# LOCKED_ON centering sub-phase — on fresh entry, slow-rotate to center the
+# tag tightly in frame before beginning forward approach. Tighter tolerance
+# than _drive_toward's bang-bang (±60 px) so approach starts well-aimed.
+CENTER_TURN_SPEED     = SMOOTH_TURN_SPEED / 4     # PWM — slower than SMOOTH_TURN_SPEED for fine aim
+CENTER_PX_TOL         = 20      # pixels — considered centered once |dx| < this
 
 TAG_ID_TO_STATION = {tid: name for name, tid in TAG_IDS.items()}
 
@@ -366,7 +372,9 @@ class SipServe:
     def __init__(self):
         self.bus = smbus2.SMBus(1)
         self.i2c_lock = threading.Lock()
-        self.motor = Motor(self.bus)
+        # Share the lock with Motor so its bus writes can't collide with the
+        # ultrasonic mux poller or voice poller on bus 1.
+        self.motor = Motor(self.bus, i2c_lock=self.i2c_lock)
         self.motor.set_motor_parameter()
         self.motor.stop()
 
@@ -387,6 +395,10 @@ class SipServe:
         self._search_phase: str | None = None
         self._search_phase_start: float = 0.0
         self._search_scan_deg: float = 0.0
+        # LOCKED_ON has a one-shot centering sub-phase — False on fresh entry,
+        # latches True once the tag is tightly centered, then _drive_toward
+        # handles the approach with its own bang-bang steering.
+        self._locked_centered: bool = False
         self._update_lcd()
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
@@ -409,6 +421,9 @@ class SipServe:
             if new == State.SEARCHING:
                 # Sentinel — _tick_searching will initialize phase + timers
                 self._search_phase = None
+            if new == State.LOCKED_ON:
+                # Force a fresh slow-centering pass every time we (re)lock.
+                self._locked_centered = False
             self._update_lcd()
 
     def _current_target_name(self) -> str | None:
@@ -572,11 +587,21 @@ class SipServe:
             self._set_state(State.LOCKED_ON)
             return
 
-        # First tick of a fresh SEARCHING entry — initialize the phase cycle.
+        # First tick of a fresh SEARCHING entry — kick off a one-shot 180°
+        # smooth rotation to face away from the tag we were just parked at
+        # (home, or the last delivery). This blocks for ~180 / DEG_PER_SEC_AT_SMOOTH_TURN
+        # seconds; subsequent ticks run the roam/scan cycle.
         if self._search_phase is None:
-            self._search_phase = "roam"
+            self._search_phase = "initial_rotate"
             self._search_phase_start = time.monotonic()
             self._search_scan_deg = 0.0
+
+        if self._search_phase == "initial_rotate":
+            print("  SEARCHING: smooth 180° turn-away before roam")
+            self.motor.rotate(180)
+            self._search_phase = "roam"
+            self._search_phase_start = time.monotonic()
+            return
 
         if self._search_phase == "roam":
             if time.monotonic() - self._search_phase_start >= ROAM_DURATION:
@@ -612,6 +637,30 @@ class SipServe:
             self._lost_since = time.monotonic()
             self._set_state(State.LOST)
             return
+
+        # Centering sub-phase — slow-rotate until the tag is tightly centered,
+        # then latch and fall through to the approach. Gives the approach a
+        # clean initial heading instead of relying on bang-bang while driving.
+        if not self._locked_centered:
+            info = self.tags.get_tag(target)
+            px = info.get("px") if info else None
+            if px is None:
+                # Tag is visible but no fresh pixel this tick — hold still so
+                # the next camera frame has a chance to report a clean center.
+                self.motor.stop()
+                return
+            dx = px - TAG_INPUT_W / 2.0
+            if abs(dx) < CENTER_PX_TOL:
+                self.motor.stop()
+                self._locked_centered = True
+                print(f"  LOCKED_ON: centered (dx={dx:.0f}px) — beginning approach")
+            elif dx > 0:
+                self.motor.turn_right(CENTER_TURN_SPEED)
+                return
+            else:
+                self.motor.turn_left(CENTER_TURN_SPEED)
+                return
+
         self._drive_toward(target)
 
     def _tick_lost(self):
