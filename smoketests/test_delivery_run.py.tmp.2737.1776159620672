@@ -2,19 +2,19 @@
 """
 Delivery round-trip: clear startup path, wait for destination request, navigate
 to AprilTag, pause, then return home.
-
+ 
 The robot starts by spinning until the forward path is clear and no AprilTag is
 visible.  It then waits for an operator to enter a destination.  All 5 ultrasonic
 sensors are used for obstacle avoidance.  The OAK-D-Lite camera is used to find
 and approach destination AprilTags.
-
+ 
 Usage:
     source venv4sipserve/bin/activate
     python smoketests/test_delivery_run.py
-
+ 
 Destinations (prompted interactively): table1, table2, table3, table4
 """
-
+ 
 import enum
 import math
 import os
@@ -22,16 +22,15 @@ import sys
 import threading
 import time
 from collections import deque
-
+ 
 import depthai as dai
-import numpy as np
 import smbus2
-
+ 
 # ── Path setup (same pattern as other smoketests) ────────────────────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 sys.path.insert(0, os.path.join(_HERE, ".."))
-
+ 
 import IIC
 from sensors.apriltag import (send_roi_configs,
                               TAG_INPUT_W, TAG_INPUT_H,
@@ -41,7 +40,7 @@ from hardware.mux import Mux, SENSOR_CHANNELS
 from config import TAG_IDS
 from hardware.lcd import SipServeLCD
 from sensors.voice import VoiceSensor
-
+ 
 # ── Tuning ────────────────────────────────────────────────────────────────────
 
 IMU_RATE_HZ = 100
@@ -53,70 +52,54 @@ ROAM_SPEED     = 800   # cruising while searching for tag
 CRUISE_SPEED   = 500   # driving toward a visible tag, far away
 APPROACH_SPEED = 250   # close to tag, fine control
 TURN_SPEED     = 300   # centering corrections during NAVIGATE
-SMOOTH_TURN_SPEED = 270   # 10% slower than TURN_SPEED — used only for the
-                          # continuous "find clear path / find home" rotations
-                          # so the camera has better chance to detect tags
-                          # during a non-bursted rotation.
 AVOID_TURN     = 300   # turning away from obstacles
 BACKUP_SPEED   = 300   # reversing away from an obstacle
-
+ 
 # Distance thresholds (mm)
-OBSTACLE_MM      = 203    # ~8 inches — obstacle trigger (ultrasonic + depth)
+OBSTACLE_MM      = 152    # ~6 inches — obstacle trigger (ultrasonic + depth)
 CLEAR_PATH_MM    = 610    # ~24 inches (2 ft) — center ultrasonic must read this
                           # far before SEARCHING begins forward motion
-DEPTH_CLEAR_PATH_MM = 1219  # 48 inches (4 ft) — depth-based escape for the
-                            # clear-path rotation; a depth ROI this clear is
-                            # sufficient evidence that forward motion is safe.
 SLOW_DIST_MM     = 508    # 20 inches — start slowing down near tag
 STOP_DIST_MM     = 305    # 12 inches — stop at destination
 CENTER_X_MM      = 60     # lateral offset tolerance for "centered"
-
+ 
 # Ramp zone: linear speed interpolation between these two distances
 RAMP_FAR_MM  = 508    # above this → CRUISE_SPEED
 RAMP_NEAR_MM = 300    # below this → APPROACH_SPEED
-
+ 
 # Lock-on: when tag is lost, hold heading via gyro at reduced speed
 LOCKON_SPEED       = 300   # forward speed while holding heading (tag lost)
 HEADING_TOL_DEG    = 5.0   # heading error tolerance before correcting
 HEADING_TURN_SPEED = 200   # gentle turn to correct heading drift
-
+ 
 # Timing
 TAG_LOST_TIMEOUT_S = 3.0   # seconds without tag before LOST state
 TAG_LOST_FORWARD_GRACE_S = 1.5  # coast forward this long on brief tag loss
-LOST_HOLD_S = 0.5          # hold still at LOST entry to let motion blur clear
 SEARCH_SPIN_TIMEOUT_S = 10.0  # SEARCHING: 10s with no lock → 360° spin
-POST_SPIN_SCAN_S      = 5.0   # After a failed spin, roam forward for this
-                              # long before triggering another spin. Short
-                              # forward scan lets the robot change position
-                              # in case the target tag is behind an occluder
-                              # from the current spot.
 SPIN_SWEEP_DEG     = 360.0  # how far to spin when scanning for a tag
 DELIVER_PAUSE_S    = 6.0   # seconds to pause at destination for delivery
 AVOID_TIMEOUT_S    = 4.0   # max seconds turning during obstacle avoidance
 BACKUP_S           = 0.5   # seconds to reverse if turn times out
+CLEAR_PATH_TIMEOUT_S = 8.0  # SEARCHING clear-path rotation gives up after this
 
 # Close-proximity assume-arrival: if the tag is lost while closer than this
-# distance, drive forward a short nudge and treat it as arrived.
-# Duration is hardcoded (not derived from PWM) since PWM is a power level,
-# not a velocity — convert empirically on the real robot.
+# distance, drive forward for a short time and treat it as arrived. The
+# nudge duration is a hardcoded time — we have no odometry, and dividing
+# millimeters by a PWM magnitude is dimensionally meaningless.
 CLOSE_LOST_DIST_MM     = 457   # 18 inches — "close enough" threshold
-CLOSE_LOST_NUDGE_SPEED = APPROACH_SPEED  # PWM magnitude for the nudge
-CLOSE_LOST_NUDGE_S     = 0.5   # empirical — ~6 inches at APPROACH_SPEED
-
-# SEARCHING clear-path rotation: max time to wait for 2 ft of center clearance
-# before giving up and proceeding (prevents infinite spin in a tight corridor).
-SEARCH_CLEAR_PATH_TIMEOUT_S = 8.0
-
+CLOSE_LOST_NUDGE_SPEED = APPROACH_SPEED  # speed for the nudge
+CLOSE_LOST_NUDGE_S     = 0.5   # empirical — ~6 inches at APPROACH_SPEED; tune on-robot
+ 
 # Burst-rotate timing: short turn bursts with pauses to avoid motion blur
 # on the AprilTag detector (camera needs a still frame to detect reliably).
 SEARCH_ROTATE_BURST_S = 0.3   # rotate this long per burst
 SEARCH_PAUSE_S        = 0.2   # pause after each burst to let camera settle
-
-
+ 
+ 
 # ── State machine ─────────────────────────────────────────────────────────────
-
+ 
 # ── Voice command IDs (DF2301QG custom training) ─────────────────────────────
-
+ 
 VCMD_WAKE_WORD      = 2
 VCMD_QUEUE_TABLE1   = 5
 VCMD_QUEUE_TABLE2   = 6
@@ -124,15 +107,15 @@ VCMD_QUEUE_TABLE3   = 7
 VCMD_QUEUE_TABLE4   = 8
 VCMD_CLEAR_ORDERS   = 9
 VCMD_START_DELIVERY = 10
-
+ 
 VCMD_QUEUE_MAP = {
     VCMD_QUEUE_TABLE1: "Table 1",
     VCMD_QUEUE_TABLE2: "Table 2",
     VCMD_QUEUE_TABLE3: "Table 3",
     VCMD_QUEUE_TABLE4: "Table 4",
 }
-
-
+ 
+ 
 class State(enum.Enum):
     INITIALIZING = "INITIALIZING"  # rotate until home tag found
     ORDERING     = "ORDERING"      # wait for wake word, then queue tables
@@ -141,79 +124,39 @@ class State(enum.Enum):
     LOST         = "LOST"          # lost sight of tag, re-finding
     DELIVERING   = "DELIVERING"    # paused at tag, delivery in progress
     RETURNING    = "RETURNING"     # heading home after all deliveries
-
-
+ 
+ 
 # ── Motor helpers ─────────────────────────────────────────────────────────────
 # Negative PWM = forward on this robot (wiring is inverted).
 # M1 = right tread, M3 = left tread.
-
-# Hard safety floor: if any front-facing ultrasonic reads < OBSTACLE_MM (8"),
-# forward() and arc_drive() refuse to move. `stop()`, `backward()`, and turns
-# are always allowed so the FSM can still back away or rotate to clear.
-# `deliver()` registers the live UltrasonicPoller via set_safety_sonar().
-_safety_sonar = None
-_safety_tripped = False   # rising-edge flag for logging
-
-def set_safety_sonar(sonar) -> None:
-    """Register an UltrasonicPoller as the hard-stop safety source."""
-    global _safety_sonar
-    _safety_sonar = sonar
-
-def _safety_halt() -> bool:
-    """True if forward motion must be blocked. Logs once per rising edge."""
-    global _safety_tripped
-    tripped = _safety_sonar is not None and _safety_sonar.front_blocked()
-    if tripped and not _safety_tripped:
-        print("  [SAFETY] Front ultrasonic <8\" — forward halted")
-        _safety_tripped = True
-    elif not tripped and _safety_tripped:
-        _safety_tripped = False
-    return tripped
-
+ 
 def stop():
     IIC.control_pwm(0, 0, 0, 0)
-
+ 
 def forward(speed=ROAM_SPEED):
-    if _safety_halt():
-        IIC.control_pwm(0, 0, 0, 0)
-        return
     IIC.control_pwm(-speed, 0, -speed, 0)
-
+ 
 def backward(speed=BACKUP_SPEED):
     IIC.control_pwm(speed, 0, speed, 0)
-
+ 
 def turn_left(speed=TURN_SPEED):
     IIC.control_pwm(-speed, 0, speed, 0)
-
+ 
 def turn_right(speed=TURN_SPEED):
     IIC.control_pwm(speed, 0, -speed, 0)
-
-
+ 
+ 
 # Proportional steering constant: how aggressively to steer per mm of offset.
-# Lower values mean gentler arcs — less rotational motion during forward drive
-# so less motion blur on the AprilTag detector. The SEARCHING/LOCKED FSM gates
-# on _tag_in_fov (30° window) anyway, so large steering corrections rarely
-# fire in practice — a small gain is sufficient for residual drift.
-STEER_GAIN = 0.5
-
-
+# At STEER_GAIN=1.0 and x_mm=200, the slower tread runs at speed - 200.
+STEER_GAIN = 1.5
+ 
+ 
 def arc_drive(speed: int, x_mm: float):
     """Drive forward while curving toward the tag.
-
+ 
     speed: base forward PWM magnitude
     x_mm:  lateral offset — positive = tag is to the right
-
-    Applies a deadband: when |x_mm| is within CENTER_X_MM (60mm, the
-    "considered centered" threshold) we drive perfectly straight — no motor
-    asymmetry, no rotation component, no motion blur from tiny drift.
     """
-    if _safety_halt():
-        IIC.control_pwm(0, 0, 0, 0)
-        return
-    if abs(x_mm) < CENTER_X_MM:
-        # Tag is close enough to centered — drive straight, no arc
-        IIC.control_pwm(-speed, 0, -speed, 0)
-        return
     steer = int(STEER_GAIN * x_mm)
     # Clamp so neither tread reverses (no in-place spin during arc)
     steer = max(-speed, min(speed, steer))
@@ -221,21 +164,21 @@ def arc_drive(speed: int, x_mm: float):
     right = speed - steer   # slow down right tread to turn right
     # Negative PWM = forward
     IIC.control_pwm(-right, 0, -left, 0)
-
-
+ 
+ 
 # ── Ultrasonic background poller ──────────────────────────────────────────────
-
+ 
 def _safe(dist: int | None) -> int:
     return dist if dist is not None else 9999
-
-
+ 
+ 
 class UltrasonicPoller:
     """Continuously polls all 5 ultrasonic sensors in a background thread.
-
+ 
     The main loop calls .snapshot() to get the latest readings without
     blocking, so the camera loop runs at full speed.
     """
-
+ 
     def __init__(self, bus: smbus2.SMBus, i2c_lock: threading.Lock | None = None):
         self._mux = Mux(bus)
         self._sensor = UltrasonicSensor(bus)
@@ -246,7 +189,7 @@ class UltrasonicPoller:
         self._running = True
         self._thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._thread.start()
-
+ 
     def wait_ready(self, timeout: float = 3.0):
         """Block until a full sensor sweep completes with at least one valid reading."""
         print("  Waiting for ultrasonic sensors…")
@@ -260,10 +203,10 @@ class UltrasonicPoller:
                 return
             self._ready.clear()
         print(f"  Sensor timeout — readings: {self.snapshot()}")
-
+ 
     def _poll_loop(self):
         """Read all 5 sensors in a continuous loop (~0.8 s per cycle).
-
+ 
         When an i2c_lock is provided, only hold it during actual I2C ops
         (trigger and read), NOT during the 150ms sensor measurement wait.
         This lets the voice poller access the mux between measurements.
@@ -282,7 +225,7 @@ class UltrasonicPoller:
                         # Voice poller may have changed the mux channel
                         # during the 150ms wait — invalidate cache and
                         # force a re-select.
-                        self._mux.invalidate()
+                        self._mux._active = None
                         self._mux.select(ch)
                         fresh[name] = self._sensor.read_result()
                 else:
@@ -291,40 +234,40 @@ class UltrasonicPoller:
             with self._lock:
                 self._readings.update(fresh)
             self._ready.set()
-
+ 
     def snapshot(self) -> dict[str, int | None]:
         """Return the most recent readings (non-blocking)."""
         with self._lock:
             return dict(self._readings)
-
+ 
     def front_blocked(self) -> bool:
         snap = self.snapshot()
         return any(_safe(snap.get(k)) < OBSTACLE_MM
                    for k in ("front", "front_left", "front_right"))
-
+ 
     def min_front_dist(self) -> int:
         """Return the minimum distance (mm) across front-facing sensors."""
         snap = self.snapshot()
         return min(_safe(snap.get(k)) for k in ("front", "front_left", "front_right"))
-
+ 
     def best_turn_dir(self) -> str:
         """Return 'left' or 'right' based on which side has more clearance."""
         snap = self.snapshot()
         return "right" if _safe(snap.get("right")) >= _safe(snap.get("left")) else "left"
-
+ 
     def stop(self):
         self._running = False
         self._thread.join(timeout=2.0)
         self._mux.disable()
-
-
+ 
+ 
 # ── Voice background poller ──────────────────────────────────────────────────
-
+ 
 VOICE_MUX_CHANNEL = 5
-
+ 
 class VoicePoller:
     """Polls the DF2301QG voice sensor in a background thread."""
-
+ 
     def __init__(self, bus: smbus2.SMBus, i2c_lock: threading.Lock | None = None):
         self._sensor = VoiceSensor(bus, mux_channel=VOICE_MUX_CHANNEL,
                                    i2c_lock=i2c_lock)
@@ -333,7 +276,7 @@ class VoicePoller:
         self._running = True
         self._thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._thread.start()
-
+ 
     def _poll_loop(self):
         while self._running:
             cmd = self._sensor.get_command_id()
@@ -341,45 +284,45 @@ class VoicePoller:
                 with self._lock:
                     self._commands.append(cmd)
             time.sleep(0.1)
-
+ 
     def get_commands(self) -> list[int]:
         """Drain and return all pending voice commands."""
         with self._lock:
             cmds = list(self._commands)
             self._commands.clear()
         return cmds
-
+ 
     def stop(self):
         self._running = False
         self._thread.join(timeout=2.0)
-
-
+ 
+ 
 # ── Pipeline builder (lightweight: AprilTag + depth + IMU, no YOLO) ───────────
-
+ 
 def build_delivery_pipeline():
     """Build a lean OAK-D-Lite pipeline for delivery navigation.
-
+ 
     Includes AprilTag detection, stereo depth, and IMU — but no YOLO or
     FeatureTracker, so there's no shave contention on the OAK-D-Lite.
     """
     pipeline = dai.Pipeline()
-
+ 
     camRgb = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
     tag_out = camRgb.requestOutput((TAG_INPUT_W, TAG_INPUT_H))
-
+ 
     monoLeft = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B)
     monoRight = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_C)
-
+ 
     stereo = pipeline.create(dai.node.StereoDepth)
     stereo.setRectification(True)
     stereo.setExtendedDisparity(True)
     monoLeft.requestOutput((640, 400)).link(stereo.left)
     monoRight.requestOutput((640, 400)).link(stereo.right)
-
+ 
     aprilTag = pipeline.create(dai.node.AprilTag)
     aprilTag.initialConfig.setFamily(dai.AprilTagConfig.Family.TAG_36H11)
     tag_out.link(aprilTag.inputImage)
-
+ 
     spatialCalc = pipeline.create(dai.node.SpatialLocationCalculator)
     stereo.depth.link(spatialCalc.inputDepth)
     spatialCalc.inputConfig.setWaitForMessage(False)
@@ -389,13 +332,13 @@ def build_delivery_pipeline():
     default_cfg.calculationAlgorithm = dai.SpatialLocationCalculatorAlgorithm.MEDIAN
     default_cfg.roi = dai.Rect(dai.Point2f(0.4, 0.4), dai.Point2f(0.6, 0.6))
     spatialCalc.initialConfig.addROI(default_cfg)
-
+ 
     imu = pipeline.create(dai.node.IMU)
     imu.enableIMUSensor(dai.IMUSensor.GYROSCOPE_RAW, IMU_RATE_HZ)
     imu.enableIMUSensor(dai.IMUSensor.ACCELEROMETER_RAW, IMU_RATE_HZ)
     imu.setBatchReportThreshold(1)
     imu.setMaxBatchReports(10)
-
+ 
     queues = {
         "tags": aprilTag.out.createOutputQueue(),
         "spatial": spatialCalc.out.createOutputQueue(),
@@ -404,17 +347,17 @@ def build_delivery_pipeline():
         "imu": imu.out.createOutputQueue(),
     }
     return pipeline, queues
-
-
+ 
+ 
 # ── Gyro tracker ──────────────────────────────────────────────────────────────
-
+ 
 class GyroTracker:
     """Integrates BMI270 raw gyroscope z-axis to track heading changes."""
-
+ 
     def __init__(self):
         self.heading_deg = 0.0
         self._prev_ts = None
-
+ 
     def update(self, imu_queue):
         while True:
             msg = imu_queue.tryGet()
@@ -429,59 +372,43 @@ class GyroTracker:
                         self.heading_deg += math.degrees(gyro.z) * dt
                 self._prev_ts = ts
         return self.heading_deg
-
+ 
     def reset(self):
         self.heading_deg = 0.0
         self._prev_ts = None
-
-
+ 
+ 
 # ── Tag helper ────────────────────────────────────────────────────────────────
-
+ 
 class TagTracker:
     """Tracks target AprilTag(s) across frames.
-
+ 
     Handles the one-frame-behind spatial data: we send an ROI for the tag
     we see now, but the spatial result we read back corresponds to the ROI
     we sent in the *previous* frame.
-
+ 
     Accepts a set of target IDs so SEARCH can match any queued tag.
     """
-
+ 
     def __init__(self):
         self._prev_tag = None  # tag object from previous frame (or None)
         self.tag_px = None     # current-frame tag center x in pixels (or None)
         self.any_tag_visible = False  # were ANY tags visible this frame?
         self.visible_ids: set[int] = set()  # IDs of all tags seen this frame
         self.visible_centers: dict[int, float] = {}  # id → pixel x of center
-        # Cache of the most recent non-empty update() result. The main loop
-        # ticks MUCH faster than the camera produces frames, so `tryGet()`
-        # returns None on most ticks. Without caching, the FSM would see
-        # "tag lost" every no-frame tick and flip state constantly.
-        self._cached_dist: float | None = None
-        self._cached_x: float | None = None
-        self._cached_found: int | None = None
-
+ 
     def update(self, queues, target_ids) -> tuple[float | None, float | None, int | None]:
         """Read one camera frame and return (dist_mm, x_mm, found_id).
-
+ 
         target_ids: a set (or single int) of tag IDs to match.
-        When no new camera frame is available this tick, returns the last
-        frame's cached result and leaves instance state (tag_px, visible_*)
-        unchanged — so the FSM sees tag state update at camera rate (~30 Hz),
-        not main-loop rate (kHz). Prevents "tag lost" false positives.
-        Returns (None, None, None) when a frame DID arrive but no target
-        tag was in it, or when no frame has ever arrived yet.
+        Returns (None, None, None) if no target tag is visible or depth is
+        not yet available.  self.tag_px is set to the tag's pixel center x
+        on the current frame (available even when depth is not).
         """
         if isinstance(target_ids, int):
             target_ids = {target_ids}
-
-        # Non-blocking: on a camera hiccup, return "no new data" sentinels so
-        # the FSM keeps ticking instead of freezing on a blocking .get().
-        tag_msg = queues["tags"].tryGet()
-        if tag_msg is None:
-            # No new frame — preserve instance state, return cached result.
-            return self._cached_dist, self._cached_x, self._cached_found
-
+ 
+        tag_msg = queues["tags"].get()
         all_tags = list(tag_msg.aprilTags)
         self.any_tag_visible = bool(all_tags)
         self.visible_ids = {t.id for t in all_tags}
@@ -491,7 +418,7 @@ class TagTracker:
             for t in all_tags
         }
         target_tags = [t for t in all_tags if t.id in target_ids]
-
+ 
         # Tag pixel position — available THIS frame, no one-frame lag
         found_id = None
         if target_tags:
@@ -502,43 +429,36 @@ class TagTracker:
             send_roi_configs([tag], queues["spatial_cfg"])
         else:
             self.tag_px = None
-
-        # Spatial data corresponds to the *previous* frame's ROI. Only trust it
-        # if this frame's target is the same tag id we sent ROI for last frame;
-        # otherwise depth could be attributed to the wrong tag.
-        spatial_msg = queues["spatial"].tryGet()
-        spatial_locs = spatial_msg.getSpatialLocations() if spatial_msg else []
-
+ 
+        # Read spatial data (corresponds to *previous* frame's ROI)
+        spatial_msg = queues["spatial"].get()
+        spatial_locs = spatial_msg.getSpatialLocations()
+ 
         dist_mm = None
         x_mm = None
-        if (self._prev_tag is not None and spatial_locs
-                and found_id is not None and found_id == self._prev_tag.id):
+        if self._prev_tag is not None and spatial_locs:
             loc = spatial_locs[0]
             z = loc.spatialCoordinates.z
             if z > 0:
                 dist_mm = z
                 x_mm = loc.spatialCoordinates.x
-
+ 
         self._prev_tag = target_tags[0] if target_tags else None
-        # Cache so no-frame ticks can return a consistent result.
-        self._cached_dist = dist_mm
-        self._cached_x = x_mm
-        self._cached_found = found_id
         return dist_mm, x_mm, found_id
-
-
+ 
+ 
 # Camera center x in pixels — offset from this = how far off-center the tag is
 _CAM_CENTER_PX = TAG_INPUT_W / 2.0
 # Rough scale: convert pixel offset to approximate mm offset for arc_drive.
 # At ~1m distance, 1 pixel ≈ 1.5 mm lateral offset (rough FOV estimate).
 PX_TO_MM = 1.5
-
-
+ 
+ 
 def pixel_x_to_offset(tag_px: float) -> float:
     """Convert tag pixel x to a lateral mm-like offset for steering."""
     return (tag_px - _CAM_CENTER_PX) * PX_TO_MM
-
-
+ 
+ 
 # Horizontal FOV of the OAK-D-Lite RGB camera (IMX214).  If the tag output
 # is cropped/scaled, tune this value to match the effective HFOV.
 CAM_HFOV_DEG = 69.0
@@ -546,19 +466,19 @@ CAM_HFOV_DEG = 69.0
 # on the camera centerline.  Outside this window → stop and rotate to center.
 TARGET_FOV_DEG = 30.0
 FOV_HALF_PX = (TARGET_FOV_DEG / CAM_HFOV_DEG) * (TAG_INPUT_W / 2.0)
-
-
+ 
+ 
 def _tag_in_fov(tag_px: float | None, half_px: float = FOV_HALF_PX) -> bool:
     """True if the tag's pixel-x is within the configured FOV window."""
     if tag_px is None:
         return False
     return abs(tag_px - _CAM_CENTER_PX) <= half_px
-
-
+ 
+ 
 # Pixel band around camera center used to detect a wrong tag crossing through.
 CENTER_BAND_PX = 40.0
-
-
+ 
+ 
 def _wrong_tag_centered(tracker, target_id: int,
                         band_px: float = CENTER_BAND_PX) -> bool:
     """True if a NON-target tag is currently near the camera center."""
@@ -568,29 +488,29 @@ def _wrong_tag_centered(tracker, target_id: int,
         if abs(px - _CAM_CENTER_PX) < band_px:
             return True
     return False
-
-
+ 
+ 
 def _flip_dir(direction: str) -> str:
     return "left" if direction == "right" else "right"
-
-
+ 
+ 
 def _bearing_to_dir(bearing: float | None, default: str = "right") -> str:
     """Pick initial rotate direction from last-known bearing sign."""
     if bearing is None or bearing == 0:
         return default
     return "right" if bearing > 0 else "left"
-
-
+ 
+ 
 def _rotate_in(direction: str, speed: int):
     if direction == "right":
         turn_right(speed)
     else:
         turn_left(speed)
-
-
+ 
+ 
 def _burst_rotate(direction: str, speed: int):
     """Rotate in a short burst then pause to let the camera settle.
-
+ 
     This avoids motion blur on the AprilTag detector — the camera needs
     a still frame to detect tags reliably.
     """
@@ -598,18 +518,14 @@ def _burst_rotate(direction: str, speed: int):
     time.sleep(SEARCH_ROTATE_BURST_S)
     stop()
     time.sleep(SEARCH_PAUSE_S)
-
-
+ 
+ 
 def _spin_search(gyro, queues, tracker, target_ids: set[int],
                  sweep_deg: float = SPIN_SWEEP_DEG) -> bool:
     """Spin in place up to *sweep_deg* scanning for any tag in target_ids.
     Uses burst-rotate pattern to avoid motion blur on the AprilTag detector.
-    Returns True and stops the moment a target is seen INSIDE the drive-toward
-    FOV window (_tag_in_fov). Stopping on an edge-of-frame detection leads to
-    over-rotation cascades later when LOCKED commits to an approach with the
-    tag already near the periphery of the camera.
-    Returns False if the full sweep completes without a centered target.
-    Uses gyro to integrate absolute yaw change.
+    Returns True and stops the moment a target is seen, else finishes the
+    sweep and returns False.  Uses gyro to integrate absolute yaw change.
     """
     gyro.reset()
     gyro.update(queues["imu"])
@@ -621,19 +537,17 @@ def _spin_search(gyro, queues, tracker, target_ids: set[int],
         # Pause: let camera settle and grab a frame
         time.sleep(SEARCH_PAUSE_S)
         gyro.update(queues["imu"])
-        # Check for target tag during the still moment — require it to be in
-        # the drive-toward FOV window, not merely visible at the edge.
+        # Check for target tag during the still moment
         dist_mm, _, found_id = tracker.update(queues, target_ids)
-        if (found_id is not None and found_id in target_ids
-                and _tag_in_fov(tracker.tag_px)):
+        if found_id is not None and found_id in target_ids:
             stop()
             return True
     stop()
     return False
-
-
+ 
+ 
 # ── Speed helpers ─────────────────────────────────────────────────────────────
-
+ 
 def compute_speed(dist_mm: float) -> int:
     """Linear ramp from CRUISE_SPEED down to APPROACH_SPEED."""
     if dist_mm >= RAMP_FAR_MM:
@@ -642,36 +556,19 @@ def compute_speed(dist_mm: float) -> int:
         return APPROACH_SPEED
     ratio = (dist_mm - RAMP_NEAR_MM) / (RAMP_FAR_MM - RAMP_NEAR_MM)
     return int(APPROACH_SPEED + ratio * (CRUISE_SPEED - APPROACH_SPEED))
-
-
-def _proximity_speed(near_mm: int, max_speed: int) -> int:
-    """Scale a forward speed down as an obstacle gets closer.
-
-    Returns `max_speed` when clear (>= SLOW_DIST_MM), `APPROACH_SPEED` when
-    at the OBSTACLE_MM floor, and a linear interpolation in between.
-    Use for SEARCHING/RETURNING-style roaming where the thing in front is
-    unknown — NOT for LOCKED, where the "obstacle" is usually the target
-    tag and we want the tag-distance ramp (compute_speed) to govern speed.
-    """
-    if near_mm >= SLOW_DIST_MM:
-        return max_speed
-    if near_mm <= OBSTACLE_MM:
-        return APPROACH_SPEED
-    ratio = (near_mm - OBSTACLE_MM) / (SLOW_DIST_MM - OBSTACLE_MM)
-    return int(APPROACH_SPEED + ratio * (max_speed - APPROACH_SPEED))
-
-
+ 
+ 
 TURN_AWAY_TIMEOUT_S = 6.0  # max seconds to turn away from arrived tag
-
-
+ 
+ 
 # Fraction of the depth frame (centered) sampled for forward obstacle detection.
 _DEPTH_ROI_FRAC = 0.4
-
-
+ 
+ 
 def _depth_front_blocked(depth_queue, threshold_mm: int = OBSTACLE_MM) -> bool:
     """Read the latest stereo-depth frame; return True if the center ROI has
     any valid pixel closer than `threshold_mm`.
-
+ 
     Drains all queued depth frames so we always act on the freshest one.
     Returns False if no frame is available yet.
     """
@@ -697,82 +594,29 @@ def _depth_front_blocked(depth_queue, threshold_mm: int = OBSTACLE_MM) -> bool:
     if valid.size == 0:
         return False
     return int(valid.min()) < threshold_mm
-
-
-def _depth_front_roi(depth_queue):
-    """Grab the newest depth frame's center ROI. Returns a 1-D numpy array of
-    valid pixels (in mm), or an empty array if no data. Drains the queue so
-    we always act on the freshest frame."""
-    msg = None
-    while True:
-        m = depth_queue.tryGet()
-        if m is None:
-            break
-        msg = m
-    if msg is None:
-        return np.empty(0, dtype=np.int32)
-    frame = msg.getFrame()
-    if frame is None or frame.size == 0:
-        return np.empty(0, dtype=np.int32)
-    h, w = frame.shape[:2]
-    y1 = int(h * (0.5 - _DEPTH_ROI_FRAC / 2))
-    y2 = int(h * (0.5 + _DEPTH_ROI_FRAC / 2))
-    x1 = int(w * (0.5 - _DEPTH_ROI_FRAC / 2))
-    x2 = int(w * (0.5 + _DEPTH_ROI_FRAC / 2))
-    roi = frame[y1:y2, x1:x2]
-    return roi[(roi > 0) & (roi < 10000)]
-
-
-def _depth_front_min_mm(depth_queue) -> int:
-    """Nearest valid mm in the center depth ROI (99999 if no valid frame).
-
-    Sensitive — used for obstacle detection and proximity slowdown where we
-    want any close pixel to count. For clear-path checks use
-    `_depth_front_clear_mm` instead, which tolerates a few noisy pixels.
-    """
-    valid = _depth_front_roi(depth_queue)
-    return int(valid.min()) if valid.size else 99999
-
-
-def _depth_front_clear_mm(depth_queue, percentile: float = 10.0) -> int:
-    """Robust "nearest real obstacle" in the depth ROI — the Nth-percentile
-    distance instead of the absolute minimum, so occasional noise pixels
-    (stereo artifacts, low-texture dropouts, floor edges) don't disqualify
-    an otherwise-clear path. Returns 99999 when no usable data.
-
-    Default percentile=10: up to 10% of valid ROI pixels can be noise before
-    the clear-path check is defeated.
-    """
-    valid = _depth_front_roi(depth_queue)
-    # Require at least a reasonable fraction of the ROI to be valid — if the
-    # whole depth frame is black (shadow, reflection, out-of-range) we can't
-    # make claims about clearance.
-    if valid.size < 100:
-        return 99999
-    return int(np.percentile(valid, percentile))
-
-
+ 
+ 
 def _front_blocked(sonar, depth_queue, threshold_mm: int = OBSTACLE_MM) -> bool:
     """Unified obstacle check: True if ultrasonic OR depth reads < threshold."""
     return sonar.front_blocked() or _depth_front_blocked(depth_queue, threshold_mm)
-
-
+ 
+ 
 def _rotate_to_reacquire_tag(sonar, queues, tracker, target_id: int,
                              tag_bearing: float | None = None,
                              prefer_dir: str | None = None,
                              timeout: float = AVOID_TIMEOUT_S) -> str:
     """Rotate in place (biased toward the tag) until the front is clear AND
     the target tag is visible inside the drive-toward FOV window.
-
+ 
     Uses burst-rotate pattern to avoid motion blur on the AprilTag detector.
-
+ 
     Direction priority (highest first):
         1. tag_bearing side, if that side has clearance > OBSTACLE_MM
         2. prefer_dir (sticky from a previous rotation), if that side has
            clearance > OBSTACLE_MM — prevents ping-ponging back into the
            obstacle we just cleared
         3. The more-open side (fallback)
-
+ 
     Returns the direction used ("left" or "right").  Feed this back in as
     prefer_dir on the next call to stay committed.
     """
@@ -789,7 +633,7 @@ def _rotate_to_reacquire_tag(sonar, queues, tracker, target_id: int,
         want_clear = right_clear if want == "right" else left_clear
         if want_clear > OBSTACLE_MM:
             direction = want
-
+ 
     print(f"  LOCKED: rotating {direction} — seeking clear path + tag in FOV")
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -809,16 +653,16 @@ def _rotate_to_reacquire_tag(sonar, queues, tracker, target_id: int,
     stop()
     print("  LOCKED: rotate-reacquire timed out")
     return direction
-
-
+ 
+ 
 def _rotate_clear(sonar, queues, gyro,
                   tag_bearing: float | None = None,
                   prefer_dir: str | None = None,
                   timeout: float = AVOID_TIMEOUT_S) -> str:
     """Rotate to clear an obstacle.
-
+ 
     Uses burst-rotate pattern to avoid motion blur on the AprilTag detector.
-
+ 
     Direction priority (highest first):
         1. tag_bearing side, if that side has clearance > OBSTACLE_MM —
            keeps the target tag in view during avoidance
@@ -826,7 +670,7 @@ def _rotate_clear(sonar, queues, gyro,
            clearance > OBSTACLE_MM — prevents ping-ponging back into the
            obstacle we just cleared
         3. The more-open side (fallback)
-
+ 
     After clearing, nudges forward briefly to get past the obstacle.
     Falls back to a short backup if rotating alone doesn't clear the path.
     Returns the direction used ("left" or "right").  Feed this back in as
@@ -835,20 +679,20 @@ def _rotate_clear(sonar, queues, gyro,
     snap = sonar.snapshot()
     left_clear = _safe(snap.get("left"))
     right_clear = _safe(snap.get("right"))
-
+ 
     direction = "right" if right_clear >= left_clear else "left"
-
+ 
     if prefer_dir in ("left", "right"):
         prefer_clear = right_clear if prefer_dir == "right" else left_clear
         if prefer_clear > OBSTACLE_MM:
             direction = prefer_dir
-
+ 
     if tag_bearing is not None and tag_bearing != 0:
         want_right = tag_bearing > 0
         want_side_clear = right_clear if want_right else left_clear
         if want_side_clear > OBSTACLE_MM:
             direction = "right" if want_right else "left"
-
+ 
     print(f"  Rotating {direction} to clear obstacle "
           f"(bearing={tag_bearing}, prefer={prefer_dir})…")
     deadline = time.monotonic() + timeout
@@ -875,28 +719,26 @@ def _rotate_clear(sonar, queues, gyro,
     time.sleep(BACKUP_S)
     stop()
     return direction
-
-
+ 
+ 
 def _turn_away(arrived_tag_id: int, queues: dict):
     """Spin slowly until the arrived-at tag is no longer visible."""
     print(f"  Turning away from tag {arrived_tag_id}…")
     turn_right(AVOID_TURN)
     deadline = time.monotonic() + TURN_AWAY_TIMEOUT_S
     while time.monotonic() < deadline:
-        tag_msg = queues["tags"].tryGet()
-        queues["spatial"].tryGet()  # drain independently
-        if tag_msg is None:
-            time.sleep(0.02)
-            continue
+        tag_msg = queues["tags"].get()
+        # Drain spatial queue to keep it in sync
+        queues["spatial"].get()
         visible_ids = {t.id for t in tag_msg.aprilTags}
         if arrived_tag_id not in visible_ids:
             break
     stop()
     print("  Tag out of view — ready to clear path")
-
-
+ 
+ 
 # ── Main delivery loop ───────────────────────────────────────────────────────
-
+ 
 def _queue_table_numbers(q) -> list[int]:
     """Extract table numbers from queue names for LCD display."""
     nums = []
@@ -905,8 +747,8 @@ def _queue_table_numbers(q) -> list[int]:
         if num:
             nums.append(int(num))
     return nums
-
-
+ 
+ 
 def deliver() -> None:
     # Hardware init
     IIC.set_motor_parameter()
@@ -915,26 +757,25 @@ def deliver() -> None:
     lcd = SipServeLCD(bus_number=1)
     i2c_lock = threading.Lock()
     sonar = UltrasonicPoller(bus, i2c_lock=i2c_lock)
-    set_safety_sonar(sonar)  # hard-stop forward() / arc_drive() if front <6"
     voice = VoicePoller(bus, i2c_lock=i2c_lock)
     tracker = TagTracker()
     gyro = GyroTracker()
-
+ 
     # Reverse lookup: tag ID → table name (for removing delivered tables)
     tag_id_to_name = {v: k for k, v in TAG_IDS.items() if k != "Home"}
-
+ 
     pipeline, queues = build_delivery_pipeline()
-
+ 
     with pipeline:
         pipeline.start()
-
+ 
         # Wait for sensors before moving — don't drive blind
         sonar.wait_ready()
         # Prime the camera: first frame has no spatial data (one-frame-behind),
         # so read and discard it while stationary.
         queues["tags"].get()
         queues["spatial"].get()
-
+ 
         state = State.INITIALIZING
         lcd.update_state("INITIALIZING")
         target_id = TAG_IDS["Home"]
@@ -960,40 +801,19 @@ def deliver() -> None:
         # SEARCHING start time — if no lock within SEARCH_SPIN_TIMEOUT_S the
         # robot does a 360° in-place spin to scan around for queued tags.
         search_start_time: float | None = None
-        # Has the robot already done a 360° spin in this SEARCHING episode?
-        # If yes, subsequent spins trigger after POST_SPIN_SCAN_S (shorter)
-        # instead of SEARCH_SPIN_TIMEOUT_S. Reset on every fresh SEARCHING
-        # entry and on successful tag lock-on.
-        did_spin: bool = False
         # LOST wrong-tag flip: rising-edge detection + "flip at most once per
         # LOST episode" so the robot doesn't ping-pong between wrong tags.
         wrong_centered_prev: bool = False
         lost_flipped: bool = False
-        # LOST hold-and-settle: stop briefly on entry so motion blur clears
-        # before any rotation, so we don't rotate away from a tag that's
-        # still there but temporarily blurred.
-        lost_hold_until: float | None = None
-        # Heading at LOCKED→LOST entry; used to return to the original aim
-        # on LOST timeout before handing off to SEARCHING.
-        lost_entry_heading: float | None = None
         # SEARCHING: robot starts facing home — must rotate until the center
         # ultrasonic reads >= 2 ft before driving forward.
         search_path_clear: bool = False
-        # Start time of the clear-path rotation phase, for timeout fallback.
-        clear_path_start: float | None = None
-        # RETURNING initial rotation: after a delivery we're facing the just-
-        # delivered tag. Rotate until home is spotted OR depth reads 4ft clear,
-        # then fall through to normal RETURNING logic.
-        return_path_clear: bool = False
-        return_path_rotation_start: float | None = None
-
+ 
         try:
             while pipeline.isRunning():
                 gyro.update(queues["imu"])
-
+ 
                 # ── Voice commands — only processed during ORDERING ───────
-                # Wake word gates table-queuing only. CLEAR and START work at
-                # any time so the operator can always cancel or launch.
                 if state == State.ORDERING:
                     started_delivery = False
                     for cmd in voice.get_commands():
@@ -1001,10 +821,10 @@ def deliver() -> None:
                             wake_word_heard = True
                             print("  Voice: wake word — ready for orders")
                             continue
+                        if not wake_word_heard:
+                            continue
                         table_name = VCMD_QUEUE_MAP.get(cmd)
                         if table_name:
-                            if not wake_word_heard:
-                                continue
                             if table_name not in delivery_queue:
                                 delivery_queue.append(table_name)
                             lcd.update_queue(_queue_table_numbers(delivery_queue))
@@ -1017,18 +837,12 @@ def deliver() -> None:
                             tracker = TagTracker()
                             gyro.reset()
                             last_dist_mm = None
-                            # Drain each queue independently so they don't desync
                             while queues["tags"].tryGet() is not None:
-                                pass
-                            while queues["spatial"].tryGet() is not None:
-                                pass
+                                queues["spatial"].tryGet()
                             sonar.wait_ready()
                             wake_word_heard = False  # must re-wake after deliveries
                             target_label = None
                             search_path_clear = False
-                            clear_path_start = None
-                            search_start_time = None
-                            did_spin = False
                             state = State.SEARCHING
                             lcd.update_state("SEARCHING")
                             print(f"  Voice: START — delivering to {', '.join(delivery_queue)}")
@@ -1036,7 +850,7 @@ def deliver() -> None:
                             break
                     if started_delivery:
                         continue
-
+ 
                 # ── INITIALIZING: burst-rotate until home tag is seen ─────
                 if state == State.INITIALIZING:
                     tag_msg = queues["tags"].tryGet()
@@ -1050,14 +864,14 @@ def deliver() -> None:
                         lcd.update_state("ORDERING")
                     else:
                         _burst_rotate("right", AVOID_TURN)
-
+ 
                 # ── ORDERING: stationary, wait for voice input ─────────────
                 elif state == State.ORDERING:
                     stop()
                     queues["tags"].tryGet()
                     queues["spatial"].tryGet()
                     time.sleep(0.05)
-
+ 
                 # ── SEARCHING: avoid obstacles, scan for any queued tag ───
                 elif state == State.SEARCHING:
                     # After starting from ORDERING or finishing a delivery the
@@ -1066,8 +880,6 @@ def deliver() -> None:
                     # queued delivery tag is spotted during the rotation, abandon
                     # the clear-path search and lock on immediately.
                     if not search_path_clear:
-                        if clear_path_start is None:
-                            clear_path_start = time.monotonic()
                         # Check if a queued tag is visible during the rotation
                         if committed_target_id is not None:
                             rotate_search_ids = {committed_target_id}
@@ -1076,7 +888,6 @@ def deliver() -> None:
                         dist_mm, x_mm, found_id = tracker.update(queues, rotate_search_ids)
                         if dist_mm is not None and _tag_in_fov(tracker.tag_px):
                             search_path_clear = True
-                            clear_path_start = None
                             target_id = found_id
                             target_label = tag_id_to_name.get(target_id, f"tag{target_id}")
                             last_dist_mm = dist_mm
@@ -1085,55 +896,20 @@ def deliver() -> None:
                             last_avoid_dir = None
                             committed_target_id = target_id
                             search_start_time = None
-                            did_spin = False
                             state = State.LOCKED
                             lcd.update_state("LOCKED", target_label)
                             print(f"  SEARCH (rotating): spotted {target_label} at {dist_mm:.0f}mm — locking on")
                             continue
-
-                        # Timeout fallback — don't spin forever in a tight space.
-                        # Hand off to _rotate_clear so we actively resolve the
-                        # near obstacle instead of declaring the path clear and
-                        # driving into whatever is in front.
-                        if time.monotonic() - clear_path_start > SEARCH_CLEAR_PATH_TIMEOUT_S:
-                            print(f"  SEARCH: clear-path rotation timed out "
-                                  f"(>{SEARCH_CLEAR_PATH_TIMEOUT_S:.0f}s) — handing off to _rotate_clear")
-                            last_avoid_dir = _rotate_clear(
-                                sonar, queues, gyro,
-                                prefer_dir=last_avoid_dir)
-                            search_path_clear = True
-                            clear_path_start = None
-                            continue
-
-                        # Clear-path escape: EITHER center ultrasonic reads
-                        # ≥ 2 ft, OR depth ROI reports ≥ 4 ft of clearance.
-                        # Depth catches the "far-open scene" case the narrow
-                        # ultrasonic beam can miss; ultrasonic catches close
-                        # low-texture / glass obstacles depth misses.
-                        # Depth check uses 10th-percentile (robust) so a few
-                        # noise pixels don't defeat an otherwise-clear frame.
+ 
                         snap = sonar.snapshot()
                         center_dist = _safe(snap.get("front"))
-                        near_depth = _depth_front_clear_mm(queues["depth"])
-                        ultrasonic_clear = center_dist >= CLEAR_PATH_MM
-                        depth_clear = (near_depth < 99999
-                                       and near_depth >= DEPTH_CLEAR_PATH_MM)
-                        if ultrasonic_clear or depth_clear:
+                        if center_dist >= CLEAR_PATH_MM:
                             search_path_clear = True
-                            clear_path_start = None
-                            reason = "ultrasonic" if ultrasonic_clear else "depth"
-                            print(f"  SEARCH: clear path found via {reason} "
-                                  f"(front={center_dist}mm depth={near_depth}mm)")
-                            # Fall through next tick — avoid double tracker.update
+                            print(f"  SEARCH: clear path found ({center_dist}mm >= {CLEAR_PATH_MM}mm)")
+                        else:
+                            _burst_rotate("right", TURN_SPEED)
                             continue
-                        # Smooth continuous rotation (not burst): this phase is
-                        # pivoting away from a tag we're sitting on top of — we
-                        # want to find clearance fast, not accumulate still-frame
-                        # tag detections. The tag-spotted escape path above still
-                        # runs every tick so we can lock on mid-rotation.
-                        turn_right(SMOOTH_TURN_SPEED)
-                        continue
-
+ 
                     # Obstacle first — always safe before moving
                     if _front_blocked(sonar, queues["depth"]):
                         stop()
@@ -1141,43 +917,31 @@ def deliver() -> None:
                             sonar, queues, gyro,
                             prefer_dir=last_avoid_dir)
                         continue
-
+ 
                     # If we've already committed to a specific delivery tag
                     # (previously locked and lost), only that tag can re-lock us.
                     if committed_target_id is not None:
                         search_ids = {committed_target_id}
                     else:
                         search_ids = {TAG_IDS[n] for n in delivery_queue}
-
-                    # Start the search-timeout clock on first tick in SEARCHING
+ 
+                    # Start the 10s search-timeout clock on first tick in SEARCHING
                     if search_start_time is None:
                         search_start_time = time.monotonic()
-
-                    # Timeout before next 360° spin:
-                    #   - SEARCH_SPIN_TIMEOUT_S (10s) on the first spin of this
-                    #     SEARCHING episode, while roaming forward from entry.
-                    #   - POST_SPIN_SCAN_S (5s) between subsequent spins, so
-                    #     after a failed spin the robot moves forward briefly
-                    #     (scanning as it goes) before trying another spin.
-                    #   If a tag enters the FOV during either phase, the
-                    #   tracker.update check below locks on and abandons the
-                    #   timer entirely.
-                    current_spin_timeout = (POST_SPIN_SCAN_S if did_spin
-                                            else SEARCH_SPIN_TIMEOUT_S)
-                    if time.monotonic() - search_start_time > current_spin_timeout:
+ 
+                    # 10s with no lock → 360° in-place spin to scan for a tag
+                    if time.monotonic() - search_start_time > SEARCH_SPIN_TIMEOUT_S:
                         stop()
-                        print(f"  SEARCH: no lock in {current_spin_timeout:.0f}s"
-                              f" — 360° scan spin")
+                        print("  SEARCH: no lock in 10s — 360° scan spin")
                         found = _spin_search(gyro, queues, tracker, search_ids)
                         search_start_time = time.monotonic()
-                        did_spin = True
                         if found:
                             # Promote to LOCKED immediately on next tick
                             continue
                         continue
-
+ 
                     dist_mm, x_mm, found_id = tracker.update(queues, search_ids)
-
+ 
                     if dist_mm is not None and _tag_in_fov(tracker.tag_px):
                         target_id = found_id
                         target_label = tag_id_to_name.get(target_id, f"tag{target_id}")
@@ -1187,20 +951,14 @@ def deliver() -> None:
                         last_avoid_dir = None
                         committed_target_id = target_id
                         search_start_time = None
-                        did_spin = False
                         state = State.LOCKED
                         lcd.update_state("LOCKED", target_label)
                         print(f"  {target_label} (tag {target_id}) locked at {dist_mm:.0f}mm")
                         continue
-
-                    # No queued tag near center — keep roaming forward.
-                    # Speed ramps down proportionally to the nearest obstacle
-                    # (ultrasonic OR depth), so the robot decelerates smoothly
-                    # as things get closer rather than flipping binary.
-                    near_mm = min(sonar.min_front_dist(),
-                                  _depth_front_min_mm(queues["depth"]))
-                    forward(_proximity_speed(near_mm, ROAM_SPEED))
-
+ 
+                    # No queued tag near center — keep roaming forward
+                    forward(ROAM_SPEED)
+ 
                 # ── LOCKED: center + approach with speed ramp ─────────────
                 elif state == State.LOCKED:
                     # Obstacle priority: wait, then rotate to reacquire a clear
@@ -1212,13 +970,13 @@ def deliver() -> None:
                             tag_bearing=last_tag_bearing,
                             prefer_dir=last_avoid_dir)
                         continue
-
+ 
                     dist_mm, x_mm, _ = tracker.update(queues, {target_id})
-
+ 
                     # Tag visible anywhere → reset lost-grace timer
                     if dist_mm is not None or tracker.tag_px is not None:
                         lost_entry_time = None
-
+ 
                     # ── Tag fully lost: close enough → nudge forward and deliver ─
                     if dist_mm is None and tracker.tag_px is None:
                         # If we were within 18 inches when we lost the tag,
@@ -1227,30 +985,27 @@ def deliver() -> None:
                         # arrived — avoids spinning in LOST right next to the
                         # table.
                         if last_dist_mm is not None and last_dist_mm <= CLOSE_LOST_DIST_MM:
+                            nudge_time = CLOSE_LOST_NUDGE_MM / CLOSE_LOST_NUDGE_SPEED
                             print(f"  LOCK tag lost at {last_dist_mm:.0f}mm (<={CLOSE_LOST_DIST_MM}mm)"
-                                  f" — nudging forward {CLOSE_LOST_NUDGE_S:.1f}s and delivering")
+                                  f" — nudging {CLOSE_LOST_NUDGE_MM}mm forward and delivering")
                             forward(CLOSE_LOST_NUDGE_SPEED)
-                            nudge_deadline = time.monotonic() + CLOSE_LOST_NUDGE_S
-                            while time.monotonic() < nudge_deadline:
-                                if _front_blocked(sonar, queues["depth"]):
-                                    print("  Nudge aborted — obstacle in path")
-                                    break
-                                time.sleep(0.05)
+                            time.sleep(nudge_time)
                             stop()
                             last_avoid_dir = None
                             state = State.DELIVERING
                             lcd.update_state("DELIVERING", target_label)
                             print(f"  Assumed arrival at {target_label}")
                             continue
-
+ 
                         if lost_entry_time is None:
                             lost_entry_time = time.monotonic()
                         elapsed = time.monotonic() - lost_entry_time
                         if elapsed < TAG_LOST_FORWARD_GRACE_S:
-                            # Coast at APPROACH_SPEED only — faster coasting
-                            # perpetuates the motion blur that caused the loss.
+                            speed = (APPROACH_SPEED
+                                     if last_dist_mm is not None and last_dist_mm < SLOW_DIST_MM
+                                     else CRUISE_SPEED)
                             bearing = last_tag_bearing if last_tag_bearing is not None else 0.0
-                            arc_drive(APPROACH_SPEED, bearing)
+                            arc_drive(speed, bearing)
                             print(f"  LOCK tag lost {elapsed:.1f}s — coasting forward")
                             continue
                         # Enter LOST rotating OPPOSITE the side the tag was
@@ -1260,17 +1015,11 @@ def deliver() -> None:
                         search_rotate_dir = _flip_dir(bearing_dir)
                         wrong_centered_prev = False
                         lost_flipped = False
-                        # Hold-and-settle first so motion blur can clear before
-                        # any rotation. Remember the heading so we can return
-                        # to the original aim if the full LOST timeout fires.
-                        lost_hold_until = time.monotonic() + LOST_HOLD_S
-                        lost_entry_heading = gyro.heading_deg
                         state = State.LOST
                         lcd.update_state("LOST", target_label)
-                        print(f"  LOCKED → LOST ({target_label}) — holding {LOST_HOLD_S:.1f}s "
-                              f"then rotating {search_rotate_dir}")
+                        print(f"  LOCKED → LOST ({target_label}) — rotating {search_rotate_dir}")
                         continue
-
+ 
                     # ── Tag seen in pixels but no depth: pixel-steer forward ─
                     if dist_mm is None:
                         px_offset = pixel_x_to_offset(tracker.tag_px)
@@ -1280,10 +1029,10 @@ def deliver() -> None:
                                  else CRUISE_SPEED)
                         arc_drive(speed, px_offset)
                         continue
-
+ 
                     last_dist_mm = dist_mm
                     last_tag_bearing = x_mm
-
+ 
                     # Stop at destination
                     if dist_mm <= STOP_DIST_MM:
                         stop()
@@ -1292,19 +1041,17 @@ def deliver() -> None:
                         lcd.update_state("DELIVERING", target_label)
                         print(f"  Arrived at {target_label} ({dist_mm:.0f}mm)")
                         continue
-
+ 
                     # Drive forward while steering toward the tag, regardless
                     # of where it is in the camera frame.  arc_drive clamps
                     # the steer so one tread idles at full offset — a tight
                     # forward arc — instead of spinning in place.
-                    # Speed is governed by tag distance only; the "obstacle" in
-                    # front at close range is almost always the target tag, so
-                    # sonar-based slowdown would creep forever and never arrive.
-                    # The hard safety halt still catches <6" emergencies.
                     speed = compute_speed(dist_mm)
+                    if sonar.min_front_dist() < SLOW_DIST_MM:
+                        speed = min(speed, APPROACH_SPEED)
                     arc_drive(speed, x_mm)
                     print(f"  LOCK dist={dist_mm:.0f}mm x={x_mm:+.0f}mm speed={speed}")
-
+ 
                 # ── LOST: burst-rotate to reacquire target ────────────────
                 elif state == State.LOST:
                     if _front_blocked(sonar, queues["depth"]):
@@ -1314,79 +1061,38 @@ def deliver() -> None:
                             tag_bearing=last_tag_bearing,
                             prefer_dir=last_avoid_dir)
                         continue
-
-                    # Hold-and-settle: sit still at the start of LOST so any
-                    # motion blur clears before rotating. If the tag reappears
-                    # during the hold, jump straight back to LOCKED with no
-                    # rotation at all.
-                    if lost_hold_until is not None and time.monotonic() < lost_hold_until:
-                        stop()
-                        dist_mm, x_mm, _ = tracker.update(queues, {target_id})
-                        if (dist_mm is not None or tracker.tag_px is not None) \
-                                and _tag_in_fov(tracker.tag_px):
-                            lost_entry_time = None
-                            lost_hold_until = None
-                            lost_entry_heading = None
-                            search_rotate_dir = None
-                            last_avoid_dir = None
-                            state = State.LOCKED
-                            lcd.update_state("LOCKED", target_label)
-                            print(f"  LOST → LOCKED ({target_label}) — blur cleared, no rotation")
-                        continue
-                    lost_hold_until = None
-
+ 
                     dist_mm, x_mm, _ = tracker.update(queues, {target_id})
                     if (dist_mm is not None or tracker.tag_px is not None) \
                             and _tag_in_fov(tracker.tag_px):
                         lost_entry_time = None
-                        lost_entry_heading = None
                         search_rotate_dir = None
                         last_avoid_dir = None
                         state = State.LOCKED
                         lcd.update_state("LOCKED", target_label)
                         print(f"  LOST → LOCKED ({target_label})")
                         continue
-
+ 
                     if lost_entry_time is None:
                         lost_entry_time = time.monotonic()
                     if time.monotonic() - lost_entry_time > TAG_LOST_TIMEOUT_S:
-                        # Return to the heading we had when LOCKED → LOST fired,
-                        # so SEARCHING hands off aimed where the tag was — not
-                        # at a random bearing we drifted to during rotation.
-                        if lost_entry_heading is not None:
-                            gyro.update(queues["imu"])
-                            heading_err = gyro.heading_deg - lost_entry_heading
-                            return_deadline = time.monotonic() + AVOID_TIMEOUT_S
-                            while abs(heading_err) > HEADING_TOL_DEG and time.monotonic() < return_deadline:
-                                if heading_err > 0:
-                                    turn_left(HEADING_TURN_SPEED)
-                                else:
-                                    turn_right(HEADING_TURN_SPEED)
-                                time.sleep(0.05)
-                                gyro.update(queues["imu"])
-                                heading_err = gyro.heading_deg - lost_entry_heading
-                            stop()
-                            print(f"  LOST: returned to entry heading (err={heading_err:+.1f}°)")
-                            lost_entry_heading = None
-
                         lost_entry_time = None
                         search_rotate_dir = None
                         wrong_centered_prev = False
                         lost_flipped = False
                         search_start_time = None
-                        did_spin = False
                         search_path_clear = True  # skip clear-path rotation from LOST
                         state = State.SEARCHING
                         lcd.update_state("SEARCHING")
                         print("  LOST → SEARCHING (timeout)")
                         continue
-
+ 
                     # Rotate in place to search for the target.  Direction was
                     # seeded on LOCKED → LOST entry (opposite the bearing side).
                     if search_rotate_dir is None:
                         bearing_dir = _bearing_to_dir(last_tag_bearing, "right")
                         search_rotate_dir = _flip_dir(bearing_dir)
-
+ 
                     # If a non-target tag crosses the camera center, flip
                     # direction — but only once per LOST episode so we don't
                     # ping-pong between multiple wrong tags.
@@ -1396,9 +1102,9 @@ def deliver() -> None:
                         lost_flipped = True
                         print(f"  LOST: wrong tag centered — flipping to {search_rotate_dir}")
                     wrong_centered_prev = wrong_now
-
+ 
                     _burst_rotate(search_rotate_dir, TURN_SPEED)
-
+ 
                 # ── DELIVERING: 6s pause, unqueue, route to next ──────────
                 elif state == State.DELIVERING:
                     stop()
@@ -1409,19 +1115,16 @@ def deliver() -> None:
                         delivery_queue.remove(delivered_name)
                     committed_target_id = None
                     lcd.update_queue(_queue_table_numbers(delivery_queue))
-
+ 
                     _turn_away(target_id, queues)
                     tracker = TagTracker()
                     last_dist_mm = None
                     last_tag_bearing = None
                     sonar.wait_ready()
-
+ 
                     if delivery_queue:
                         target_label = None
                         search_path_clear = False
-                        clear_path_start = None
-                        search_start_time = None
-                        did_spin = False
                         state = State.SEARCHING
                         lcd.update_state("SEARCHING")
                         print(f"  Remaining: {', '.join(delivery_queue)}")
@@ -1430,12 +1133,10 @@ def deliver() -> None:
                         target_id = TAG_IDS["Home"]
                         home_last_bearing = None
                         search_rotate_dir = None
-                        return_path_clear = False
-                        return_path_rotation_start = None
                         state = State.RETURNING
                         lcd.update_state("RETURNING", target_label)
                         print("  All tables delivered — heading home…")
-
+ 
                 # ── RETURNING: navigate to home, back to ORDERING ─────────
                 elif state == State.RETURNING:
                     # Obstacle first — rotate to keep line-of-sight to home
@@ -1446,52 +1147,10 @@ def deliver() -> None:
                             tag_bearing=home_last_bearing,
                             prefer_dir=last_avoid_dir)
                         continue
-
+ 
                     home_id = TAG_IDS["Home"]
                     dist_mm, x_mm, _ = tracker.update(queues, {home_id})
-                    home_visible = dist_mm is not None or tracker.tag_px is not None
-
-                    # Initial rotation phase: we just finished a delivery and
-                    # are facing the delivered tag. Rotate smoothly until
-                    # either home is spotted OR depth reads ≥ 4 ft clear.
-                    # Mirrors SEARCHING's clear-path gate.
-                    if not return_path_clear:
-                        if home_visible:
-                            return_path_clear = True
-                            return_path_rotation_start = None
-                            print("  RETURN: home spotted — escape initial rotation")
-                            # Fall through to arc_drive branches below
-                        else:
-                            if return_path_rotation_start is None:
-                                return_path_rotation_start = time.monotonic()
-
-                            # Timeout fallback: hand off to _rotate_clear so
-                            # we actively escape a tight spot rather than spin
-                            # forever.
-                            if time.monotonic() - return_path_rotation_start > SEARCH_CLEAR_PATH_TIMEOUT_S:
-                                print(f"  RETURN: initial rotation timed out "
-                                      f"(>{SEARCH_CLEAR_PATH_TIMEOUT_S:.0f}s) — handing off to _rotate_clear")
-                                last_avoid_dir = _rotate_clear(
-                                    sonar, queues, gyro,
-                                    prefer_dir=last_avoid_dir)
-                                return_path_clear = True
-                                return_path_rotation_start = None
-                                continue
-
-                            near_depth = _depth_front_clear_mm(queues["depth"])
-                            if near_depth < 99999 and near_depth >= DEPTH_CLEAR_PATH_MM:
-                                return_path_clear = True
-                                return_path_rotation_start = None
-                                print(f"  RETURN: depth clear ({near_depth}mm "
-                                      f">= {DEPTH_CLEAR_PATH_MM}mm) — stopping rotation")
-                                continue
-
-                            # Smooth rotate away from the just-delivered tag
-                            if search_rotate_dir is None:
-                                search_rotate_dir = _bearing_to_dir(home_last_bearing, "right")
-                            _rotate_in(search_rotate_dir, SMOOTH_TURN_SPEED)
-                            continue
-
+ 
                     # Arrived at home
                     if dist_mm is not None and dist_mm <= STOP_DIST_MM:
                         stop()
@@ -1499,13 +1158,11 @@ def deliver() -> None:
                         wake_word_heard = False
                         target_label = None
                         home_last_bearing = None
-                        return_path_clear = False
-                        return_path_rotation_start = None
                         lcd.update_queue([])
                         state = State.ORDERING
                         lcd.update_state("ORDERING")
                         continue
-
+ 
                     # Home visible with depth — normal approach, reset scan state
                     if dist_mm is not None:
                         home_last_bearing = x_mm
@@ -1517,15 +1174,13 @@ def deliver() -> None:
                                 turn_left(TURN_SPEED)
                             print(f"  RETURN out-of-FOV (px={tracker.tag_px}) — rotating")
                             continue
-                        # Speed is governed by tag distance only; the "obstacle"
-                        # at close range is usually the home tag itself, so
-                        # sonar-based slowdown would creep forever. Hard safety
-                        # halt (<6") still catches emergencies.
                         speed = compute_speed(dist_mm)
+                        if sonar.min_front_dist() < SLOW_DIST_MM:
+                            speed = min(speed, APPROACH_SPEED)
                         arc_drive(speed, x_mm)
                         print(f"  RETURN dist={dist_mm:.0f}mm x={x_mm:+.0f}mm speed={speed}")
                         continue
-
+ 
                     # Home visible in pixels but no depth yet — pixel steer,
                     # gated by the drive-toward FOV window.
                     if tracker.tag_px is not None:
@@ -1541,40 +1196,30 @@ def deliver() -> None:
                             continue
                         arc_drive(CRUISE_SPEED, px_offset)
                         continue
-
-                    # Home NOT visible — we're past the initial rotation
-                    # (return_path_clear is True here). Two sub-cases:
-                    #   a) Never seen home this trip (home_last_bearing is None)
-                    #      — depth said the path was clear, so roam forward at
-                    #      proximity-ramped speed while continuing to scan.
-                    #   b) Home was seen earlier but is now lost — burst-rotate
-                    #      to reacquire, biased toward last-seen bearing.
-                    if home_last_bearing is None:
-                        near_mm = min(sonar.min_front_dist(),
-                                      _depth_front_min_mm(queues["depth"]))
-                        forward(_proximity_speed(near_mm, ROAM_SPEED))
-                    else:
-                        if search_rotate_dir is None:
-                            search_rotate_dir = _bearing_to_dir(home_last_bearing, "right")
-                        _burst_rotate(search_rotate_dir, TURN_SPEED)
-
+ 
+                    # Home NOT visible — burst-rotate to scan, biased toward
+                    # last-seen home.
+                    if search_rotate_dir is None:
+                        search_rotate_dir = _bearing_to_dir(home_last_bearing, "right")
+ 
+                    _burst_rotate(search_rotate_dir, TURN_SPEED)
+ 
         except KeyboardInterrupt:
             print("\nAborted by user.")
         finally:
-            # `with pipeline:` tears the pipeline down on exit — don't call
-            # pipeline.stop() here, it's redundant and can log warnings.
             stop()
             voice.stop()
             sonar.stop()
             lcd.clear()
+            pipeline.stop()
             bus.close()
             print("Motors stopped, cleanup done.")
-
-
+ 
+ 
 def main():
     deliver()
-
-
+ 
+ 
 if __name__ == "__main__":
     main()
-
+ 

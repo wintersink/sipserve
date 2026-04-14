@@ -32,3 +32,11 @@ class Mux:
         """Disable all channels."""
         self.bus.write_byte(self.addr, 0x00)
         self._active = None
+
+    def invalidate(self):
+        """Force the next select() to re-send even if the channel matches cache.
+
+        Needed when another caller may have written the mux register while we
+        weren't holding the I2C lock — our cached `_active` would then be wrong.
+        """
+        self._active = None
