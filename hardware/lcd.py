@@ -30,7 +30,7 @@ class SipServeLCD:
             self._available = True
             self._lcd.clear()
             self._write_row(0, "SipServe")
-            self._write_row(2, "Tables Queued")
+            self._write_row(2, "Queued")
         except OSError as e:
             print(f"LCD init failed ({e}) — running without display")
 

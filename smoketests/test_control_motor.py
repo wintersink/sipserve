@@ -10,49 +10,55 @@ Commands:
   q  — quit
 
 Motors: M1 = right tread, M3 = left tread (M2/M4 unused).
-Positive speed = forward, negative = reverse.
 """
 
 import sys
 import os
 import time
 
-# Allow importing IIC from the same directory
-sys.path.insert(0, os.path.dirname(__file__))
-import sipserve.smoketests.IIC as IIC
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-SPEED = 720       # ~10% duty cycle (PWM range 0–7200)
+import smbus2
+from hardware.motor import Motor, FULL_SPEED
+
 DURATION = 2.0    # seconds each command runs
+
+bus = smbus2.SMBus(1)
+motor = Motor(bus)
+
 
 def stop():
     print("Stopping...")
-    IIC.control_pwm(0, 0, 0, 0)
+    motor.stop()
+
 
 def forward():
     print("Forward...")
-    IIC.control_pwm(-SPEED, 0, -SPEED, 0)
+    motor.forward()
     time.sleep(DURATION)
     stop()
+
 
 def reverse():
     print("Reverse...")
-    IIC.control_pwm(SPEED, 0, SPEED, 0)
+    motor.reverse()
     time.sleep(DURATION)
     stop()
+
 
 def turn_left():
     print("Turning left...")
-    # Left tread backward, right tread forward
-    IIC.control_pwm(-SPEED, 0, SPEED, 0)
+    motor.turn_left()
     time.sleep(DURATION)
     stop()
 
+
 def turn_right():
     print("Turning right...")
-    # Left tread forward, right tread backward
-    IIC.control_pwm(SPEED, 0, -SPEED, 0)
+    motor.turn_right()
     time.sleep(DURATION)
     stop()
+
 
 COMMANDS = {
     'f': forward,
@@ -64,8 +70,8 @@ COMMANDS = {
 
 if __name__ == "__main__":
     print("Initialising motor parameters...")
-    IIC.set_motor_parameter()
-    IIC.control_pwm(0, 0, 0, 0)
+    motor.set_motor_parameter()
+    motor.stop()
     print("Ready.  Commands: f=forward  b=reverse  l=left  r=right  s=stop  q=quit")
 
     try:

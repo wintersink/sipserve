@@ -12,29 +12,20 @@ import sys
 import os
 import time
 
-sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import IIC
 import smbus2
+from hardware.motor import Motor, SLOW_SPEED
 from hardware.mux import Mux, SENSOR_CHANNELS
 from sensors.ultrasonic import UltrasonicSensor
 
-SPEED = 360            # ~5% duty cycle (PWM range 0–7200)
-OBSTACLE_MM = 203      # 8 inches in mm (203 mm) with some margin
-POLL_INTERVAL = 0.05   # seconds between sensor sweeps
+OBSTACLE_MM   = 203      # 8 inches in mm (203 mm) with some margin
+POLL_INTERVAL = 0.05     # seconds between sensor sweeps
 
-bus = smbus2.SMBus(1)
-mux = Mux(bus)
+bus    = smbus2.SMBus(1)
+motor  = Motor(bus)
+mux    = Mux(bus)
 sensor = UltrasonicSensor(bus)
-
-
-def stop_motors():
-    IIC.control_pwm(0, 0, 0, 0)
-
-
-def drive_forward():
-    IIC.control_pwm(-SPEED, 0, -SPEED, 0)
 
 
 def read_all_sensors():
@@ -59,24 +50,20 @@ def print_readings(readings):
 
 def check_obstacle(readings):
     """Return list of sensor names that detect an obstacle within threshold."""
-    triggered = []
-    for name, dist in readings.items():
-        if dist is not None and dist < OBSTACLE_MM:
-            triggered.append(name)
-    return triggered
+    return [name for name, dist in readings.items()
+            if dist is not None and dist < OBSTACLE_MM]
 
 
 if __name__ == "__main__":
     print("Initialising motor parameters...")
-    IIC.set_motor_parameter()
-    stop_motors()
+    motor.set_motor_parameter()
+    motor.stop()
 
     print(f"Obstacle threshold: {OBSTACLE_MM} mm ({OBSTACLE_MM / 25.4:.1f} in)")
     print("Driving forward — Ctrl+C to quit\n")
 
-    driving = False
-    drive_forward()
     driving = True
+    motor.forward(SLOW_SPEED)
 
     try:
         while True:
@@ -86,11 +73,11 @@ if __name__ == "__main__":
             triggered = check_obstacle(readings)
 
             if driving and triggered:
-                stop_motors()
+                motor.stop()
                 driving = False
                 print(f"  >> OBSTACLE: {', '.join(triggered)} — stopped!")
             elif not driving and not triggered:
-                drive_forward()
+                motor.forward(SLOW_SPEED)
                 driving = True
                 print("  >> Clear — resuming forward.")
 
@@ -99,6 +86,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         pass
     finally:
-        stop_motors()
+        motor.stop()
         mux.disable()
         print("\nMotors stopped. Mux disabled.")
