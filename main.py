@@ -97,7 +97,7 @@ CENTER_PX_TOL         = 30      # pixels — considered centered once |dx| < thi
 # Pulse-and-pause centering: each tick rotates briefly, stops, then sleeps
 # so the camera grabs a still frame before the next decision. Tames the
 # overshoot caused by the motor running continuously across ticks.
-CENTER_PULSE_S        = 0.10    # rotate this long per centering pulse (~4° each)
+CENTER_PULSE_S        = 0.40    # rotate this long per centering pulse (~4° each)
 CENTER_PAUSE_S        = 0.15    # then pause for camera to settle
 
 # Cautious-approach margin (inches): when the front ultrasonic reads closer
