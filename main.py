@@ -83,15 +83,31 @@ TICK_S                = 0.1     # main loop tick interval
 # tag first, so LOCKED_ON can be entered from either phase.
 ROAM_DURATION         = 10.0     # seconds per roam phase
 SCAN_DEGREES          = 960.0    # degrees to burst-rotate per scan phase
-SEARCH_OBSTACLE_MM    = 300     # roam-phase obstacle trigger (mm)
+SEARCH_OBSTACLE_MM    = 400     # roam-phase obstacle trigger (mm)
 ROAM_REVERSE_S        = 0.5     # reverse this long when front is blocked
 ROAM_TURN_S           = 0.5     # turn this long when front is blocked
 
 # LOCKED_ON centering sub-phase — on fresh entry, slow-rotate to center the
 # tag tightly in frame before beginning forward approach. Tighter tolerance
 # than _drive_toward's bang-bang (±60 px) so approach starts well-aimed.
-CENTER_TURN_SPEED     = SMOOTH_TURN_SPEED / 4     # PWM — slower than SMOOTH_TURN_SPEED for fine aim
-CENTER_PX_TOL         = 20      # pixels — considered centered once |dx| < this
+CENTER_TURN_SPEED     = SMOOTH_TURN_SPEED   # PWM — same as smooth turn; lower
+                                            # values fall below the motor deadzone
+                                            # (1600) and produce no rotation.
+CENTER_PX_TOL         = 30      # pixels — considered centered once |dx| < this
+# Pulse-and-pause centering: each tick rotates briefly, stops, then sleeps
+# so the camera grabs a still frame before the next decision. Tames the
+# overshoot caused by the motor running continuously across ticks.
+CENTER_PULSE_S        = 0.10    # rotate this long per centering pulse (~4° each)
+CENTER_PAUSE_S        = 0.15    # then pause for camera to settle
+
+# Cautious-approach margin (inches): when the front ultrasonic reads closer
+# than the tag, leave this much clearance before the obstacle when creeping
+# forward. Lets the robot reach arrival distance even when the tag's
+# mounting surface (or something near it) trips the ultrasonic short.
+APPROACH_SAFETY_IN    = 1.0
+APPROACH_STEER_PX     = 60      # pixels — bang-bang steer threshold during approach
+CENTER_NUDGE_IN       = 2.0     # inches to nudge forward when tag lost during centering
+CENTER_NUDGE_MAX      = 5       # max nudges before giving up to LOST
 
 TAG_ID_TO_STATION = {tid: name for name, tid in TAG_IDS.items()}
 
@@ -399,6 +415,15 @@ class SipServe:
         # latches True once the tag is tightly centered, then _drive_toward
         # handles the approach with its own bang-bang steering.
         self._locked_centered: bool = False
+        self._center_nudges: int = 0
+        # INITIALIZING also runs a centering pass on the home tag before
+        # transitioning to AWAITING_ORDERS, so the robot starts each
+        # ordering cycle facing home squarely.
+        self._init_centered: bool = False
+        # RETURNING toggles between approach mode (same logic as LOCKED_ON)
+        # and search mode (roam/scan cycle) when the home tag drops out
+        # past LOST_TIMEOUT_S. Reacquiring home flips it back to approach.
+        self._return_searching: bool = False
         self._update_lcd()
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
@@ -418,12 +443,24 @@ class SipServe:
             print(f"\n[state] {self.state.value} → {new.value}")
             self.motor.stop()
             self.state = new
-            if new == State.SEARCHING:
-                # Sentinel — _tick_searching will initialize phase + timers
+            if new in (State.SEARCHING, State.LOST, State.RETURNING):
+                # Reset the roam ↔ scan cycle on entry so each search-style
+                # state starts in a known phase (SEARCHING re-runs its
+                # initial 180°; LOST and RETURNING start fresh in roam).
                 self._search_phase = None
-            if new == State.LOCKED_ON:
-                # Force a fresh slow-centering pass every time we (re)lock.
+            if new in (State.LOCKED_ON, State.RETURNING):
+                # Force a fresh slow-centering pass every time we start a
+                # new approach (LOCKED_ON or RETURNING). RETURNING starts
+                # in approach mode and only flips to search if it loses
+                # home for longer than LOST_TIMEOUT_S.
                 self._locked_centered = False
+                self._center_nudges = 0
+                self._lost_since = 0
+            if new == State.RETURNING:
+                self._return_searching = False
+            if new == State.INITIALIZING:
+                # Re-run home centering on every fresh INITIALIZING entry.
+                self._init_centered = False
             self._update_lcd()
 
     def _current_target_name(self) -> str | None:
@@ -441,6 +478,13 @@ class SipServe:
         nums = [_table_number(n) for n in self.queue]
         nums = [n for n in nums if n]
         self.lcd.update_queue(nums)
+        # Subphase row gets cleared on every state transition; live ticks
+        # set it via _set_subphase() below.
+        self.lcd.update_subphase(None)
+
+    def _set_subphase(self, text: str | None):
+        """Update LCD row 2 with the current sub-phase / decision branch."""
+        self.lcd.update_subphase(text)
 
     def _current_target_id(self) -> int | None:
         """Tag ID of the first queued station (or None if queue is empty)."""
@@ -449,10 +493,12 @@ class SipServe:
         return TAG_IDS.get(self.queue[0])
 
     def _drain_tag_events(self):
-        for kind, tid in self.tags.pop_events():
-            name = TAG_ID_TO_STATION.get(tid, f"tag{tid}")
-            verb = "detected" if kind == "detected" else "lost"
-            print(f"\n  → {name} {verb}!")
+        """Drain the per-frame detected/lost events from TagWatcher.
+
+        The FSM already handles tag presence via get_tag() + LOST_TIMEOUT_S,
+        so we just clear the deque — no per-frame printing.
+        """
+        self.tags.pop_events()
 
     def _handle_voice_in_ordering(self):
         for cmd in self.voice.drain():
@@ -477,50 +523,136 @@ class SipServe:
                     print("  Voice: start requested but queue is empty")
 
     def _arrived(self, tag_id: int) -> bool:
-        """Tag distance under ARRIVAL_DIST_IN."""
+        """Arrival check. Prefers stereo depth; falls back to ultrasonic when
+        the tag is visible but depth is unavailable (one-frame-lag misses)."""
         info = self.tags.get_tag(tag_id)
         if not info:
             return False
         dist_mm = info.get("dist_mm")
-        if dist_mm is None:
-            return False
-        return (dist_mm / MM_PER_INCH) < ARRIVAL_DIST_IN
+        if dist_mm is not None:
+            return (dist_mm / MM_PER_INCH) < ARRIVAL_DIST_IN
+        # Fallback: tag visible (px present) AND front ultrasonic close enough.
+        if info.get("px") is not None and self.sonar.front_min_in() < ARRIVAL_DIST_IN:
+            return True
+        return False
 
     def _drive_toward(self, tag_id: int):
         """One-tick steer-and-drive toward a visible tag. Caller ensures tag is visible."""
-        # Obstacle halt on front ultrasonics (but not when the tag IS the obstacle)
         front_in = self.sonar.front_min_in()
         info = self.tags.get_tag(tag_id)
         tag_in = (info["dist_mm"] / MM_PER_INCH) if info and info["dist_mm"] else None
+        px = info.get("px") if info else None
+        tag_visible = px is not None
 
-        # If the front ultrasonic is triggered by something closer than the tag, stop.
-        if front_in < OBSTACLE_STOP_IN and (tag_in is None or front_in < tag_in - 2):
-            self.motor.stop()
-            return
+        # Steering takes priority — turning in place is always safe (no
+        # forward motion). If the tag is way off-axis, re-center before
+        # any obstacle/approach decision so we don't freeze pointing at
+        # something other than the tag.  Use pulse-and-pause so the motor
+        # doesn't keep turning during the camera-frame lag and overshoot.
+        if tag_visible:
+            dx = px - TAG_INPUT_W / 2.0
+            if abs(dx) > APPROACH_STEER_PX:
+                direction = "RIGHT" if dx > 0 else "LEFT"
+                print(f"    drive: steer {direction} pulse  dx={dx:.0f}px")
+                if dx > 0:
+                    self.motor.turn_right(SMOOTH_TURN_SPEED)
+                else:
+                    self.motor.turn_left(SMOOTH_TURN_SPEED)
+                time.sleep(CENTER_PULSE_S)
+                self.motor.stop()
+                time.sleep(CENTER_PAUSE_S)
+                return
 
-        # Choose speed based on side clearance
+        # Obstacle / cautious-approach logic. Cases when front_in < OBSTACLE_STOP_IN:
+        #   1. tag_in known, obstacle clearly closer than tag (front < tag - 2):
+        #      check if there's room to creep forward to arrival without
+        #      hitting the obstacle (cautious approach). If not, halt.
+        #   2. tag_in known, ultrasonic ~= tag → fall through and drive.
+        #   3. tag_in unknown but tag visible (px) → assume sonar is reading
+        #      the tag itself; drive forward slowly.
+        #   4. tag fully invisible AND front close → real unknown obstacle, halt.
+        if front_in < OBSTACLE_STOP_IN:
+            if tag_in is not None and front_in < tag_in - 2:
+                want_in = tag_in - ARRIVAL_DIST_IN
+                safe_in = front_in - APPROACH_SAFETY_IN
+                if 0 < want_in <= safe_in:
+                    # We can reach arrival distance without colliding —
+                    # creep forward by want_in inches, then re-evaluate.
+                    print(f"    drive: CAUTIOUS approach  want={want_in:.1f}\" safe={safe_in:.1f}\"  "
+                          f"(front={front_in:.1f}\" tag={tag_in:.1f}\")")
+                    self._set_subphase(f"cautious +{want_in:.1f}\"")
+                    self.motor.move_distance(want_in * MM_PER_INCH, SLOW_SPEED)
+                    return
+                print(f"    drive: HALT obstacle  front={front_in:.1f}\" tag={tag_in:.1f}\"  "
+                      f"(want={want_in:.1f}\" > safe={safe_in:.1f}\")")
+                self.motor.stop()
+                return
+            if tag_in is None and not tag_visible:
+                print(f"    drive: HALT obstacle  front={front_in:.1f}\" tag=unknown")
+                self.motor.stop()
+                return
+            # else: ultrasonic likely seeing the tag — fall through and drive.
+
         speed = SLOW_SPEED if self.sonar.sides_min_in() < SIDE_SLOW_IN else FULL_SPEED
-
-        # Simple bang-bang steering from pixel offset
-        if info and info["px"] is not None:
-            dx = info["px"] - TAG_INPUT_W / 2.0
-            if dx > 60:
-                self.motor.turn_right(SMOOTH_TURN_SPEED)
-                return
-            elif dx < -60:
-                self.motor.turn_left(SMOOTH_TURN_SPEED)
-                return
+        print(f"    drive: FORWARD speed={speed}  front={front_in:.1f}\" tag={tag_in}")
         self.motor.forward(speed)
+
+    # ── Centering helper ──────────────────────────────────────────────────────
+
+    def _center_pulse_on(self, tag_id: int, label: str = "center") -> bool | None:
+        """One pulse of pulse-and-pause centering on tag_id.
+
+        Returns:
+          True  — already centered (|dx| < CENTER_PX_TOL); motor stopped.
+          False — pulsed in a direction; not yet centered.
+          None  — tag not visible (no fresh px); no pulse done.
+
+        Each pulse runs the motor for CENTER_PULSE_S then stops and pauses
+        CENTER_PAUSE_S so the next camera frame is captured while still.
+        Tames overshoot caused by continuous motor commands persisting
+        across the main loop's TICK_S.
+        """
+        info = self.tags.get_tag(tag_id)
+        px = info.get("px") if info else None
+        if px is None:
+            return None
+        dx = px - TAG_INPUT_W / 2.0
+        if abs(dx) < CENTER_PX_TOL:
+            self.motor.stop()
+            return True
+        direction = "RIGHT" if dx > 0 else "LEFT"
+        print(f"  {label}: pulse {direction}  dx={dx:.0f}px")
+        self._set_subphase(f"center {direction[0]} dx={dx:.0f}")
+        if dx > 0:
+            self.motor.turn_right(CENTER_TURN_SPEED)
+        else:
+            self.motor.turn_left(CENTER_TURN_SPEED)
+        time.sleep(CENTER_PULSE_S)
+        self.motor.stop()
+        time.sleep(CENTER_PAUSE_S)
+        return False
 
     # ── Per-state ticks ───────────────────────────────────────────────────────
 
     def _tick_initializing(self):
         home_id = TAG_IDS[HOME_KEY]
-        if self.tags.get_tag(home_id):
+        info = self.tags.get_tag(home_id)
+        if info:
+            # Home found — center on it before handing off to AWAITING_ORDERS.
+            if not self._init_centered:
+                result = self._center_pulse_on(home_id, "INIT")
+                if result is True:
+                    self._init_centered = True
+                    print("  INIT: centered on home — ready for orders")
+                # result False → pulsed, wait next tick. result None → no
+                # px this tick, hold still and wait for next frame.
+                if result is None:
+                    self.motor.stop()
+                return
             print("  Home tag found. Say wake word, queue tables, then 'start delivery'.")
             self._set_state(State.AWAITING_ORDERS)
             return
-        # Gentle rotation bursts to scan
+        # Home not visible — gentle rotation bursts to scan
         now = time.monotonic()
         if now >= self._search_next_burst:
             self.motor.turn_right(SMOOTH_TURN_SPEED)
@@ -577,107 +709,173 @@ class SipServe:
         else:
             self.motor.forward(FULL_SPEED)
 
+    def _search_step(self, label: str):
+        """One tick of the roam ↔ scan cycle. Caller handles the
+        'tag visible' branch and any state-specific arrival logic.
+
+        On first call (or after a state-transition reset) starts in roam.
+        Cycles: roam (ROAM_DURATION s) → scan (SCAN_DEGREES °) → roam → …
+        Used by SEARCHING (after its initial 180° turn), LOST, and RETURNING
+        when their target tag isn't visible — so each state actually
+        relocates instead of spinning in place forever.
+        """
+        if self._search_phase is None or self._search_phase == "initial_rotate":
+            self._search_phase = "roam"
+            self._search_phase_start = time.monotonic()
+            self._search_scan_deg = 0.0
+
+        if self._search_phase == "roam":
+            elapsed = time.monotonic() - self._search_phase_start
+            if elapsed >= ROAM_DURATION:
+                print(f"  {label}: roam done ({elapsed:.1f}s) → scan")
+                self.motor.stop()
+                self._search_phase = "scan"
+                self._search_scan_deg = 0.0
+                return
+            self._set_subphase(f"roam {elapsed:.0f}/{ROAM_DURATION:.0f}s")
+            self._roam_tick()
+            return
+
+        # scan
+        if self._search_scan_deg >= SCAN_DEGREES:
+            print(f"  {label}: scan done → roam")
+            self.motor.stop()
+            self._search_phase = "roam"
+            self._search_phase_start = time.monotonic()
+            return
+        print(f"  {label}: scan  {self._search_scan_deg:.0f}°/{SCAN_DEGREES:.0f}°")
+        self._set_subphase(f"scan {self._search_scan_deg:.0f}/{SCAN_DEGREES:.0f}")
+        self.motor.burst_rotate("right")
+        self._search_scan_deg += BURST_ROTATE_S * DEG_PER_SEC_AT_BURST_TURN
+
     def _tick_searching(self):
         target = self._current_target_id()
         if target is None:
+            print("  SEARCH: no target → RETURNING")
             self._set_state(State.RETURNING)
             return
         if self.tags.get_tag(target):
             self._lost_since = 0
+            print(f"  SEARCH: tag {target} found → LOCKED_ON")
             self._set_state(State.LOCKED_ON)
             return
 
-        # First tick of a fresh SEARCHING entry — kick off a one-shot 180°
-        # smooth rotation to face away from the tag we were just parked at
-        # (home, or the last delivery). This blocks for ~180 / DEG_PER_SEC_AT_SMOOTH_TURN
-        # seconds; subsequent ticks run the roam/scan cycle.
         if self._search_phase is None:
             self._search_phase = "initial_rotate"
             self._search_phase_start = time.monotonic()
             self._search_scan_deg = 0.0
 
         if self._search_phase == "initial_rotate":
-            print("  SEARCHING: smooth 180° turn-away before roam")
+            print("  SEARCH: initial 180° turn-away")
+            self._set_subphase("init 180 turn")
             self.motor.rotate(180)
             self._search_phase = "roam"
             self._search_phase_start = time.monotonic()
             return
 
-        if self._search_phase == "roam":
-            if time.monotonic() - self._search_phase_start >= ROAM_DURATION:
-                self.motor.stop()
-                self._search_phase = "scan"
-                self._search_scan_deg = 0.0
-                return
-            self._roam_tick()
-            return
+        # Roam ↔ scan cycle for the rest of SEARCHING.
+        self._search_step("SEARCH")
 
-        # "scan" — one burst_rotate per tick until SCAN_DEGREES accumulated.
-        if self._search_scan_deg >= SCAN_DEGREES:
-            self.motor.stop()
-            self._search_phase = "roam"
-            self._search_phase_start = time.monotonic()
-            return
-        self.motor.burst_rotate("right")
-        self._search_scan_deg += BURST_ROTATE_S * DEG_PER_SEC_AT_BURST_TURN
+    def _approach_target(self, target_id: int, label: str) -> str:
+        """Shared approach logic: arrival → lost-debounce → center → drive.
+
+        Used by both LOCKED_ON (delivery) and RETURNING (home) so home
+        gets the same flicker tolerance, centering pulses, and nudges.
+
+        Returns one of:
+          "arrived"  — tag close enough; caller handles state transition
+          "lost"     — tag absent past LOST_TIMEOUT_S and nudges exhausted;
+                       caller hands off to whatever search behavior fits
+          "working"  — keep ticking; motor commands already issued
+        """
+        if self._arrived(target_id):
+            return "arrived"
+
+        info = self.tags.get_tag(target_id)
+        if not info:
+            front_in = self.sonar.front_min_in()
+            # Close-range arrival fallback: if we already centered on the
+            # tag and the front ultrasonic reads inside the arrival
+            # distance, the most likely reason the tag dropped out of view
+            # is that we drove right up to it (it left the camera's
+            # vertical FOV). Declare arrived rather than restarting search.
+            if self._locked_centered and front_in < ARRIVAL_DIST_IN:
+                print(f"  {label}: tag lost while centered, front={front_in:.1f}\" → arrived")
+                return "arrived"
+            elapsed = (time.monotonic() - self._lost_since) if self._lost_since else 0
+            if self._lost_since == 0:
+                self._lost_since = time.monotonic()
+            print(f"  {label}: tag missing  absent={elapsed:.2f}s/{LOST_TIMEOUT_S}s"
+                  f"  centered={self._locked_centered}  nudges={self._center_nudges}"
+                  f"  front={front_in:.1f}\"")
+            self._set_subphase(f"missing {elapsed:.1f}/{LOST_TIMEOUT_S:.0f}s")
+            if time.monotonic() - self._lost_since >= LOST_TIMEOUT_S:
+                if (not self._locked_centered
+                        and self._center_nudges < CENTER_NUDGE_MAX
+                        and front_in > OBSTACLE_STOP_IN):
+                    self._center_nudges += 1
+                    print(f"  {label}: centering nudge {self._center_nudges}/{CENTER_NUDGE_MAX} "
+                          f"({CENTER_NUDGE_IN:.0f}\")")
+                    self._set_subphase(f"nudge {self._center_nudges}/{CENTER_NUDGE_MAX}")
+                    self.motor.move_distance(CENTER_NUDGE_IN * MM_PER_INCH,
+                                             SLOW_SPEED)
+                    self._lost_since = 0
+                    return "working"
+                return "lost"
+            return "working"
+
+        # Tag visible — reset the absence timer.
+        self._lost_since = 0
+        dist_mm = info.get("dist_mm")
+
+        if not self._locked_centered:
+            result = self._center_pulse_on(target_id, label)
+            if result is True:
+                self._locked_centered = True
+                print(f"  {label}: centered — beginning approach")
+                self._set_subphase("centered, approach")
+                # fall through to _drive_toward
+            elif result is False:
+                return "working"
+            else:
+                print(f"  {label}: centering but px=None, dist={dist_mm} — falling through")
+                self._set_subphase("center px=None")
+
+        dist_str = f"{dist_mm/MM_PER_INCH:.0f}\"" if dist_mm else "?"
+        self._set_subphase(f"approach d={dist_str}")
+        self._drive_toward(target_id)
+        return "working"
 
     def _tick_locked_on(self):
         target = self._current_target_id()
         if target is None:
+            print("  LOCKED: no target in queue → RETURNING")
             self._set_state(State.RETURNING)
             return
-        if self._arrived(target):
+        result = self._approach_target(target, "LOCKED")
+        if result == "arrived":
             name = self.queue[0]
             self.motor.stop()
             print(f"\n  >> Delivered {name}!  Pausing {DELIVERY_PAUSE_S:.0f}s…")
             self._delivered_at = time.monotonic()
             self._set_state(State.DELIVERED)
-            return
-        if not self.tags.get_tag(target):
-            self._lost_since = time.monotonic()
+        elif result == "lost":
+            print("  LOCKED: giving up → LOST")
             self._set_state(State.LOST)
-            return
-
-        # Centering sub-phase — slow-rotate until the tag is tightly centered,
-        # then latch and fall through to the approach. Gives the approach a
-        # clean initial heading instead of relying on bang-bang while driving.
-        if not self._locked_centered:
-            info = self.tags.get_tag(target)
-            px = info.get("px") if info else None
-            if px is None:
-                # Tag is visible but no fresh pixel this tick — hold still so
-                # the next camera frame has a chance to report a clean center.
-                self.motor.stop()
-                return
-            dx = px - TAG_INPUT_W / 2.0
-            if abs(dx) < CENTER_PX_TOL:
-                self.motor.stop()
-                self._locked_centered = True
-                print(f"  LOCKED_ON: centered (dx={dx:.0f}px) — beginning approach")
-            elif dx > 0:
-                self.motor.turn_right(CENTER_TURN_SPEED)
-                return
-            else:
-                self.motor.turn_left(CENTER_TURN_SPEED)
-                return
-
-        self._drive_toward(target)
 
     def _tick_lost(self):
         target = self._current_target_id()
         if target is None:
+            print("  LOST: no target → RETURNING")
             self._set_state(State.RETURNING)
             return
         if self.tags.get_tag(target):
+            print("  LOST: tag reacquired → LOCKED_ON")
             self._set_state(State.LOCKED_ON)
             return
-        # Slow scan to reacquire
-        now = time.monotonic()
-        if now >= self._search_next_burst:
-            self.motor.turn_right(SMOOTH_TURN_SPEED)
-            self._search_next_burst = now + SEARCH_ROTATE_BURST_S + SEARCH_PAUSE_S
-        elif now >= self._search_next_burst - SEARCH_PAUSE_S:
-            self.motor.stop()
+        # Use the same roam ↔ scan cycle as SEARCHING so we actually move
+        # to a new viewpoint instead of spinning in place forever.
+        self._search_step("LOST")
 
     def _tick_delivered(self):
         self.motor.stop()
@@ -694,23 +892,35 @@ class SipServe:
 
     def _tick_returning(self):
         home_id = TAG_IDS[HOME_KEY]
-        info = self.tags.get_tag(home_id)
-        if info and info.get("dist_mm") is not None:
-            if (info["dist_mm"] / MM_PER_INCH) < ARRIVAL_DIST_IN:
-                self.motor.stop()
-                print("\n  Returned home. Say wake word to place new orders.")
-                self._set_state(State.AWAITING_ORDERS)
+
+        # Search mode — entered after _approach_target returned "lost".
+        # Stay here until the home tag becomes visible again, then flip
+        # back to approach mode with a fresh centering pass.
+        if self._return_searching:
+            if self.tags.get_tag(home_id):
+                print("  RETURN: home tag reacquired → resuming approach")
+                self._return_searching = False
+                self._locked_centered = False
+                self._center_nudges = 0
+                self._lost_since = 0
+                self._search_phase = None
+                # Fall through to approach this same tick.
+            else:
+                self._search_step("RETURN")
                 return
-        if info:
-            self._drive_toward(home_id)
-        else:
-            # Lost home — scan
-            now = time.monotonic()
-            if now >= self._search_next_burst:
-                self.motor.turn_right(SMOOTH_TURN_SPEED)
-                self._search_next_burst = now + SEARCH_ROTATE_BURST_S + SEARCH_PAUSE_S
-            elif now >= self._search_next_burst - SEARCH_PAUSE_S:
-                self.motor.stop()
+
+        # Approach mode — same delivery-style logic as LOCKED_ON.
+        result = self._approach_target(home_id, "RETURN")
+        if result == "arrived":
+            front_in = self.sonar.front_min_in()
+            self.motor.stop()
+            print(f"\n  RETURN: arrived home  front={front_in:.1f}\"")
+            print("  Returned home. Say wake word to place new orders.")
+            self._set_state(State.AWAITING_ORDERS)
+        elif result == "lost":
+            print("  RETURN: home tag lost past timeout → roam/scan")
+            self._return_searching = True
+            self._search_phase = None
 
     # ── Run loop ──────────────────────────────────────────────────────────────
 
